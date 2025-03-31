@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pydantic
+huggingface_hub
+transformers
+torch
+PyMuPDF
+langchain
+langchain-community
+langchain-huggingface
+pytesseract
+pillow
+pandas
+prisma
+python-dotenv

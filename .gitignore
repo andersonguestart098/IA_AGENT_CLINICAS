@@ -1,0 +1,25 @@
+node_modules
+# Keep environment variables out of version control
+.env
+
+# Ignorar ambiente virtual
+venv/
+
+# Ignorar modelos grandes
+models/
+*.gguf
+
+# Ignorar arquivos compilados
+__pycache__/
+*.pyc
+
+# Ignorar banco local
+*.db
+
+# Logs e uploads
+logs/
+uploads/
+
+# Arquivos grandes não rastreáveis
+*.dll
+*.lib

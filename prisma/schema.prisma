@@ -1,0 +1,31 @@
+datasource db {
+  provider = "sqlite"
+   url      = "file:./prisma/dev.db"
+}
+
+generator client {
+  provider = "prisma-client-py"
+  output   = "generated"
+}
+
+model KnowledgeBase {
+  id        Int        @id @default(autoincrement())
+  origem    String
+  conteudo  String
+  timestamp DateTime   @default(now())
+  feedbacks Feedback[]
+}
+
+model Feedback {
+  id                    Int              @id @default(autoincrement())
+  question              String
+  answer                String
+  feedback              String
+  acerto                Boolean          @default(false)
+  usada_para_treinamento Boolean         @default(false)
+  timestamp             DateTime         @default(now())
+  contextoUsuario       String?
+  origemPlanta          String?
+  knowledgeBaseId       Int?
+  knowledgeBase         KnowledgeBase?   @relation(fields: [knowledgeBaseId], references: [id])
+}
