@@ -20,6 +20,7 @@ import json
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from models.embeddings import gerar_embedding
+from fastapi.responses import HTMLResponse
 
 
 # Carregar variáveis de ambiente
@@ -425,6 +426,45 @@ async def gerar_metricas():
     except Exception:
         logger.error("Erro ao gerar métricas: %s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Erro ao gerar métricas.")
+    
+@app.get("/dashboard", response_class=HTMLResponse)
+async def exibir_dashboard():
+    total = await prisma.feedback.count()
+    acertos = await prisma.feedback.count(where={"acerto": True})
+    usados = await prisma.feedback.count(where={"usada_para_treinamento": True})
+
+    taxa_acerto = round((acertos / total) * 100, 2) if total else 0
+    percentual_usado = round((usados / total) * 100, 2) if total else 0
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Dashboard IA - Cemear</title>
+        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-gray-100 text-gray-800">
+        <div class="container mx-auto p-8">
+            <h1 class="text-3xl font-bold mb-4">📊 Dashboard da IA - Cemear</h1>
+            <div class="grid grid-cols-2 gap-4">
+                <div class="bg-white shadow-md rounded-lg p-6">
+                    <h2 class="text-lg font-semibold">Feedbacks totais</h2>
+                    <p class="text-2xl">{total}</p>
+                </div>
+                <div class="bg-white shadow-md rounded-lg p-6">
+                    <h2 class="text-lg font-semibold">Feedbacks com acerto</h2>
+                    <p class="text-2xl">{acertos} ({taxa_acerto}%)</p>
+                </div>
+                <div class="bg-white shadow-md rounded-lg p-6">
+                    <h2 class="text-lg font-semibold">Usados para treinamento</h2>
+                    <p class="text-2xl">{usados} ({percentual_usado}%)</p>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 
 # Executar a aplicação
