@@ -58,7 +58,7 @@ llm = Llama(
     model_path="D:/huggingface_cache/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
     n_ctx=4096,
     n_gpu_layers=35,
-    n_threads=8,
+    n_threads=16,
     use_mlock=True,
     verbose=True,
 )
@@ -260,6 +260,65 @@ async def upload_interpreta(file: UploadFile = File(...), contexto: str = Form("
     except Exception:
         logger.error("Erro ao interpretar: %s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Erro interno ao interpretar.")
+    
+@app.post("/calcular-materiais")
+async def calcular_materiais_manualmente(
+    area: float = Form(...),
+    perimetro: float = Form(...),
+    altura_rebaixo: float = Form(0.4),
+    contexto: str = Form("")
+):
+    from math import ceil
+
+    try:
+        logger.info(f"📐 Cálculo manual solicitado - Área: {area}, Perímetro: {perimetro}, Rebaixo: {altura_rebaixo}")
+        logger.info(f"📝 Contexto: {contexto}")
+
+        # Cálculos técnicos
+        f530 = (area * 1.8) / 3
+        massa = area * 0.55
+        fita = (area * 1.5) / 150
+        gn25 = area * 16
+        cantoneira = (perimetro * 1.05) / 3
+        pendural = f530 * 3
+        arame10 = (pendural * altura_rebaixo) / 14
+        parafuso_bucha = (cantoneira * 6) + pendural
+        parafuso_13mm_pa = f530 * 2
+
+        # Resposta com base no contexto
+        contexto_lower = contexto.lower()
+
+        if "f530" in contexto_lower or "montante" in contexto_lower:
+            resposta = f"Com base na área e perímetro fornecidos, a quantidade estimada de montantes F530 é de {ceil(f530)} barras de 3 metros."
+        elif "massa" in contexto_lower:
+            resposta = f"Com base na área fornecida, a quantidade estimada de massa é de {massa:.2f} kg."
+        elif "fita" in contexto_lower:
+            resposta = f"Com base na área fornecida, a quantidade estimada de fita de papel é de {ceil(fita)} rolos."
+        elif "gn25" in contexto_lower:
+            resposta = f"Com base na área fornecida, a quantidade estimada de parafusos GN25 é de {int(gn25)} unidades."
+        elif "cantoneira" in contexto_lower:
+            resposta = f"Com base no perímetro fornecido, a quantidade estimada de cantoneiras tabica é de {ceil(cantoneira)} barras de 3 metros."
+        elif "pendural" in contexto_lower:
+            resposta = f"Com base na área fornecida, a quantidade estimada de pendurais é de {ceil(pendural)} unidades."
+        elif "arame" in contexto_lower:
+            resposta = f"Com base na área e altura do rebaixo, a quantidade estimada de arame 10 é de {arame10:.2f} kg."
+        elif "bucha" in contexto_lower:
+            resposta = f"Com base nos cálculos, a quantidade estimada de parafusos com bucha é de {ceil(parafuso_bucha)} unidades."
+        elif "parafuso 13mm" in contexto_lower or "pa" in contexto_lower:
+            resposta = f"Com base na área fornecida, a quantidade estimada de parafusos 13mm PA é de {ceil(parafuso_13mm_pa)} unidades."
+        else:
+            resposta = "Não encontrei essa informação nos documentos técnicos."
+
+        return {
+            "status": "sucesso",
+            "resposta_ia": resposta
+        }
+
+    except Exception as e:
+        logger.error(f"Erro no cálculo manual com RAG: {str(e)}")
+        raise HTTPException(status_code=500, detail="Erro ao calcular com base no banco de conhecimento.")
+
+
 
 # Modelo para requisições de feedback
 class FeedbackRequest(BaseModel):
