@@ -133,22 +133,24 @@ async def chat_endpoint(data: PromptRequest):
 
         # Prompt final para o LLaMA
         prompt = f"""
-Você é um assistente técnico da empresa Cemear.
-Use somente os dados abaixo para responder à pergunta de forma técnica.
+Você é um assistente institucional da empresa Cemear. Sua função é explicar com clareza e riqueza de detalhes informações sobre a empresa, com base nos documentos oficiais abaixo.
 
-Base de Conhecimento:
+🧠 Base de Conhecimento:
 {contexto_base}
 
-Pergunta:
+📩 Pergunta do usuário:
 {data.question}
 
-Regras:
-- Seja direto e objetivo.
-- Não repita termos ou hashtags.
-- Não use emojis.
-- Dê no máximo 3 parágrafos.
-- Se não souber, diga: "Não encontrei essa informação nos documentos."
+🎯 Instruções:
+- Elabore uma resposta com início, meio e fim, de forma natural.
+- Seja técnico e institucional, mas com um tom acolhedor e fluido.
+- Evite repetir palavras, expressões ou estruturas.
+- Nunca invente fatos. Use **somente** o conteúdo fornecido na base de conhecimento.
+- Se a informação não estiver nos documentos, responda com: "Não encontrei essa informação nos documentos técnicos."
+
+✍️ Responda em até 3 parágrafos, priorizando qualidade e clareza.
 """
+
 
         resposta = llm(
             prompt,
