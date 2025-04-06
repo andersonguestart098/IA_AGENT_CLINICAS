@@ -1,31 +1,42 @@
-datasource db {
-  provider = "sqlite"
-   url      = "file:./prisma/dev.db"
-}
-
 generator client {
   provider = "prisma-client-py"
-  output   = "generated"
+  interface = "asyncio"  // Mudado de "sync" para "asyncio"
 }
 
-model KnowledgeBase {
-  id        Int        @id @default(autoincrement())
-  origem    String
-  conteudo  String
-  timestamp DateTime   @default(now())
-  feedbacks Feedback[]
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
 }
 
 model Feedback {
-  id                    Int              @id @default(autoincrement())
-  question              String
-  answer                String
-  feedback              String
-  acerto                Boolean          @default(false)
-  usada_para_treinamento Boolean         @default(false)
-  timestamp             DateTime         @default(now())
-  contextoUsuario       String?
-  origemPlanta          String?
-  knowledgeBaseId       Int?
-  knowledgeBase         KnowledgeBase?   @relation(fields: [knowledgeBaseId], references: [id])
+  id                      Int      @id @default(autoincrement())
+  question                String
+  answer                  String
+  feedback                String
+  acerto                  Boolean  @default(false)
+  usada_para_treinamento  Boolean  @default(false)
+  timestamp               DateTime @default(now())
+  origemPlanta            String?
+  contextoUsuario         String?
+  knowledgeBaseId         Int?
+  knowledgeBase           KnowledgeBase? @relation(fields: [knowledgeBaseId], references: [id])
+}
+
+model KnowledgeBase {
+  id        Int         @id @default(autoincrement())
+  origem    String
+  conteudo  String
+  embedding String?     // Agora é uma string com JSON do vetor
+  timestamp DateTime    @default(now())
+  feedbacks Feedback[]
+}
+
+model Metricas {
+  id              Int      @id @default(autoincrement())
+  totalFeedbacks  Int
+  acertos         Int
+  taxaAcerto      Float
+  usadosTreino    Int
+  percentualUsado Float
+  criadoEm        DateTime @default(now())
 }

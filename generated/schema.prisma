@@ -1,11 +1,11 @@
-datasource db {
-  provider = "sqlite"
-  url      = "file:./prisma/dev.db"
-}
-
 generator client {
   provider = "prisma-client-py"
-  output   = "generated"
+  output   = "../generated" // Gera na pasta 'generated' no nível raiz
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
 }
 
 model KnowledgeBase {

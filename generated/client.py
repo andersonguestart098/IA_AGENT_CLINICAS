@@ -85,10 +85,10 @@ __all__ = (
 
 log: logging.Logger = logging.getLogger(__name__)
 
-SCHEMA_PATH = Path('C:/IA-CEMEAR/IA_CEMEAR/prisma/schema.prisma')
+SCHEMA_PATH = Path('D:/IA2/CEMEAR-IA-FIX/prisma/schema.prisma')
 PACKAGED_SCHEMA_PATH = Path(__file__).parent.joinpath('schema.prisma')
 ENGINE_TYPE: EngineType = EngineType.binary
-BINARY_PATHS = model_parse(BinaryPaths, {'queryEngine': {'windows': 'C:\\Users\\cemea\\.cache\\prisma-python\\binaries\\5.17.0\\393aa359c9ad4a4bb28630fb5613f9c281cde053\\node_modules\\prisma\\query-engine-windows.exe'}, 'introspectionEngine': {}, 'migrationEngine': {}, 'libqueryEngine': {}, 'prismaFmt': {}})
+BINARY_PATHS = model_parse(BinaryPaths, {'queryEngine': {'windows': 'C:\\Users\\NovoAdmin\\.cache\\prisma-python\\binaries\\5.17.0\\393aa359c9ad4a4bb28630fb5613f9c281cde053\\node_modules\\prisma\\query-engine-windows.exe'}, 'introspectionEngine': {}, 'migrationEngine': {}, 'libqueryEngine': {}, 'prismaFmt': {}})
 
 
 class Prisma(AsyncBasePrisma):
@@ -141,8 +141,8 @@ class Prisma(AsyncBasePrisma):
     def _default_datasource(self) -> Datasource:
         return {
             'name': 'db',
-            'url': OptionalValueFromEnvVar(**{'value': 'file:./prisma/dev.db', 'fromEnvVar': None}).resolve(),
-            'source_file_path': 'C:/IA-CEMEAR/IA_CEMEAR/prisma/schema.prisma',
+            'url': OptionalValueFromEnvVar(**{'value': None, 'fromEnvVar': 'DATABASE_URL'}).resolve(),
+            'source_file_path': 'D:/IA2/CEMEAR-IA-FIX/prisma/schema.prisma',
         }
 
     async def execute_raw(self, query: LiteralString, *args: Any) -> int:

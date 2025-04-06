@@ -1,25 +1,41 @@
-node_modules
-# Keep environment variables out of version control
-.env
-
-# Ignorar ambiente virtual
+# Ambiente virtual
 venv/
 
-# Ignorar modelos grandes
-models/
-*.gguf
+# Configurações sensíveis
+.env
 
-# Ignorar arquivos compilados
+# Banco de dados local
+*.db
+*.db-journal
+
+# Modelos de IA e arquivos grandes
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Cache do Python
 __pycache__/
 *.pyc
-
-# Ignorar banco local
-*.db
+*.pyo
+*.pyd
 
 # Logs e uploads
 logs/
 uploads/
 
-# Arquivos grandes não rastreáveis
-*.dll
-*.lib
+# Arquivos de diagnóstico, testes ou scripts locais
+diagnostico.py
+test.py
+
+# Prisma gerado
+generated/
+prisma/generated/
+
+# VSCode
+.vscode/
+
+# Backups e temporários
+*.bak
+*.tmp
