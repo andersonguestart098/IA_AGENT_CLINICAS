@@ -3,7 +3,12 @@ import traceback
 import logging
 import sys
 import io
+from functools import lru_cache
+from transformers import AutoTokenizer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from llama_cpp import Llama
 from prisma import Prisma
@@ -17,11 +22,8 @@ import pdfplumber
 from pdf2image import convert_from_bytes
 from dotenv import load_dotenv
 import json
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+import asyncio
 from models.embeddings import gerar_embedding
-from fastapi.responses import HTMLResponse
-
 
 # Carregar variáveis de ambiente
 load_dotenv()
@@ -37,7 +39,7 @@ Path("uploads").mkdir(parents=True, exist_ok=True)
 Path("logs").mkdir(parents=True, exist_ok=True)
 
 # Configurar o Tesseract (Windows)
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
 
 # Configurar logging com UTF-8
 logging.basicConfig(
@@ -57,11 +59,16 @@ app = FastAPI()
 llm = Llama(
     model_path="D:/huggingface_cache/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
     n_ctx=4096,
-    n_gpu_layers=35,
+    n_gpu_layers=100,
     n_threads=16,
+    n_batch=512,
     use_mlock=True,
-    verbose=True,
+    f16_kv=True,
+    verbose=True
 )
+
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
 # Função para extrair texto de arquivos
 async def extrair_texto(content: bytes, file: UploadFile) -> str:
@@ -82,6 +89,27 @@ async def extrair_texto(content: bytes, file: UploadFile) -> str:
                 texto += pytesseract.image_to_string(image)
     return texto
 
+# Função para truncar contexto com base em tokens
+def truncate_context(documents, max_tokens=1500):
+    context = ""
+    current_tokens = 0
+    for doc in documents:
+        doc_text = f"- {doc}\n\n"
+        doc_tokens = len(tokenizer.encode(doc_text))
+        if current_tokens + doc_tokens > max_tokens:
+            remaining_tokens = max_tokens - current_tokens
+            truncated_doc = tokenizer.decode(tokenizer.encode(doc_text)[:remaining_tokens])
+            context += truncated_doc
+            break
+        context += doc_text
+        current_tokens += doc_tokens
+    return context.strip()
+
+# Cache para geração de embeddings
+@lru_cache(maxsize=1000)
+def cached_gerar_embedding(question: str) -> str:
+    return gerar_embedding(question)
+
 # Eventos de inicialização e encerramento
 @app.on_event("startup")
 async def startup():
@@ -95,78 +123,110 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await prisma.disconnect()
-    logger.info("🛑 Prisma desconectado.")
+    logger.info("🔕 Prisma desconectado.")
 
 # Modelo para requisições de chat
 class PromptRequest(BaseModel):
     question: str
 
-
 # Endpoint de chat
 @app.post("/chat")
 async def chat_endpoint(data: PromptRequest):
     try:
+        if not data.question or len(data.question.strip()) < 3:
+            logger.warning("⚠️ Pergunta inválida recebida.")
+            return {"answer": "Por favor, envie uma pergunta válida.\nFim da resposta."}
+
         logger.info(f"🤖 Pergunta recebida no /chat: {data.question}")
 
-        # Buscar vetores salvos com embedding
-        todos = await prisma.knowledgebase.find_many(where={"embedding": {"not": None}})
-        embedding_pergunta = np.array(json.loads(gerar_embedding(data.question))).reshape(1, -1)
+        # Buscar todos os documentos com embeddings
+        for attempt in range(3):
+            try:
+                todos = await prisma.knowledgebase.find_many(where={"embedding": {"not": None}})
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ Tentativa {attempt + 1} falhou: {e}")
+                if attempt == 2:
+                    raise HTTPException(status_code=500, detail="Erro ao acessar o banco de dados.")
+                await asyncio.sleep(1)
 
-        # Calcular similaridade entre a pergunta e os vetores
-        relevantes = []
+        if not todos:
+            logger.info("⚠️ Nenhum documento com embedding encontrado.")
+            return {"answer": "Não encontrei essa informação nos documentos técnicos.\nFim da resposta."}
+
+        # Gerar embedding da pergunta
+        embedding_pergunta = np.array(json.loads(cached_gerar_embedding(data.question))).reshape(1, -1)
+
+        embeddings = []
+        metadata = []
         for k in todos:
             try:
                 vetor = np.array(json.loads(k.embedding)).reshape(1, -1)
-                score = float(cosine_similarity(embedding_pergunta, vetor)[0][0])
-                relevantes.append((k, score))
+                embeddings.append(vetor)
+                metadata.append(k)
             except Exception as e:
-                logger.warning(f"⚠️ Erro ao calcular similaridade com ID {k.id}: {e}")
+                logger.warning(f"⚠️ Erro ao processar embedding ID {k.id}: {e}")
                 continue
 
-        # Top 5 mais relevantes
-        top = sorted(relevantes, key=lambda x: x[1], reverse=True)[:5]
-        conteudos_unicos = list(dict.fromkeys(k.conteudo.strip()[:500] for k, _ in top))
-        contexto_base = "\n\n".join(f"- {c}" for c in conteudos_unicos)
+        if not embeddings or not metadata:
+            logger.warning("⚠️ Nenhum embedding utilizável.")
+            return {"answer": "Não encontrei essa informação nos documentos técnicos.\nFim da resposta."}
 
-        logger.info("🔎 Top 5 similaridades:")
-        for k, score in top:
+        # Similaridade entre pergunta e base
+        embeddings_stack = np.vstack(embeddings)
+        scores = cosine_similarity(embedding_pergunta, embeddings_stack)[0]
+
+        # Ordenar por similaridade
+        relevantes = [(metadata[i], score) for i, score in enumerate(scores)]
+        top_relevantes = sorted(relevantes, key=lambda x: x[1], reverse=True)
+        top_validos = [r for r in top_relevantes if r[1] >= 0.4][:5]  # Limiar mais tolerante
+
+        if not top_validos:
+            logger.info("⚠️ Nenhuma similaridade relevante encontrada.")
+            return {"answer": "Não encontrei essa informação nos documentos técnicos.\nFim da resposta."}
+
+        # Log de documentos usados
+        for k, score in top_validos:
             logger.info(f"🧩 ID: {k.id} | Score: {round(score, 4)} | Origem: {k.origem}")
 
-        # Prompt com instruções reforçadas e sinal de fim
+        # Construção do prompt baseado nos melhores documentos
+        documentos = '\n'.join(f"- (Score: {round(score, 4)}) {k.conteudo.strip()}" for k, score in top_validos)
+
         prompt = f"""
-Você é um assistente técnico institucional da empresa Cemear. Sua função é fornecer respostas objetivas, técnicas e detalhadas com base nos documentos oficiais abaixo.
+Você é um assistente técnico da empresa Cemear.
 
-🧠 Base de Conhecimento:
-{contexto_base}
+Responda apenas com base nos documentos técnicos fornecidos abaixo.  
+Priorize informações de documentos com maior pontuação de similaridade.  
+Se os documentos não responderem completamente à pergunta, diga:  
+"Não encontrei essa informação nos documentos técnicos."  
+Finalize sempre com: "Fim da resposta."
 
-📩 Pergunta do usuário:
+📚 Documentos técnicos relevantes:
+{documentos}
+
+❓ Pergunta:
 {data.question}
 
-🎯 Instruções:
-- Responda de forma técnica, precisa e baseada exclusivamente no conteúdo fornecido.
-- Nunca repita a pergunta ou resposta.
-- Não gere múltiplas versões da mesma resposta.
-- Responda em **uma única vez**, com no máximo 6 parágrafos.
-- Nunca invente informações. Se não souber, diga: "Não encontrei essa informação nos documentos técnicos."
-- 🚫 Finalize sua resposta com a frase: **"Fim da resposta."**
-
-✍️ Redija agora a resposta com base nas instruções acima:
+📝 Resposta:
 """
 
         resposta_raw = llm(
             prompt,
-            max_tokens=2048,
-            temperature=0.4,
-            top_p=0.8,
-            repeat_penalty=1.8,  # penalização forte para evitar repetição
+            max_tokens=1024,
+            temperature=0.1,
+            top_p=0.6,
+            repeat_penalty=1.8,
             presence_penalty=1.0
         )["choices"][0]["text"].strip()
 
-        # Pós-processamento: remover linhas duplicadas
-        linhas_unicas = list(dict.fromkeys(resposta_raw.splitlines()))
-        resposta_final = "\n".join(linhas_unicas).strip()
+        resposta_final = resposta_raw
+        if "Fim da resposta" not in resposta_final:
+            resposta_final += "\nFim da resposta."
 
-        logger.info(f"🧠 Resposta gerada: {resposta_final}")
+        if len(resposta_final.strip()) < 10:
+            resposta_final = "Não encontrei essa informação nos documentos técnicos.\nFim da resposta."
+
+        logger.info(f"🧠 Resposta final: {resposta_final}")
         return {"answer": resposta_final}
 
     except Exception:
