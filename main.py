@@ -112,7 +112,7 @@ async def chat_endpoint(data: PromptRequest):
         todos = await prisma.knowledgebase.find_many(where={"embedding": {"not": None}})
         embedding_pergunta = np.array(json.loads(gerar_embedding(data.question))).reshape(1, -1)
 
-        # Calcular similaridade entre a pergunta e cada vetor salvo
+        # Calcular similaridade entre a pergunta e os vetores
         relevantes = []
         for k in todos:
             try:
@@ -123,17 +123,18 @@ async def chat_endpoint(data: PromptRequest):
                 logger.warning(f"⚠️ Erro ao calcular similaridade com ID {k.id}: {e}")
                 continue
 
-        # Seleciona os 5 mais relevantes por similaridade
+        # Top 5 mais relevantes
         top = sorted(relevantes, key=lambda x: x[1], reverse=True)[:5]
-        contexto_base = "\n\n".join(f"- {k.conteudo.strip()[:500]}" for k, _ in top)
+        conteudos_unicos = list(dict.fromkeys(k.conteudo.strip()[:500] for k, _ in top))
+        contexto_base = "\n\n".join(f"- {c}" for c in conteudos_unicos)
 
         logger.info("🔎 Top 5 similaridades:")
         for k, score in top:
             logger.info(f"🧩 ID: {k.id} | Score: {round(score, 4)} | Origem: {k.origem}")
 
-        # Prompt final para o LLaMA
+        # Prompt com instruções reforçadas e sinal de fim
         prompt = f"""
-Você é um assistente institucional da empresa Cemear. Sua função é explicar com clareza e riqueza de detalhes informações sobre a empresa, com base nos documentos oficiais abaixo.
+Você é um assistente técnico institucional da empresa Cemear. Sua função é fornecer respostas objetivas, técnicas e detalhadas com base nos documentos oficiais abaixo.
 
 🧠 Base de Conhecimento:
 {contexto_base}
@@ -142,31 +143,36 @@ Você é um assistente institucional da empresa Cemear. Sua função é explicar
 {data.question}
 
 🎯 Instruções:
-- Elabore uma resposta com início, meio e fim, de forma natural.
-- Seja técnico e institucional, mas com um tom acolhedor e fluido.
-- Evite repetir palavras, expressões ou estruturas.
-- Nunca invente fatos. Use **somente** o conteúdo fornecido na base de conhecimento.
-- Se a informação não estiver nos documentos, responda com: "Não encontrei essa informação nos documentos técnicos."
+- Responda de forma técnica, precisa e baseada exclusivamente no conteúdo fornecido.
+- Nunca repita a pergunta ou resposta.
+- Não gere múltiplas versões da mesma resposta.
+- Responda em **uma única vez**, com no máximo 6 parágrafos.
+- Nunca invente informações. Se não souber, diga: "Não encontrei essa informação nos documentos técnicos."
+- 🚫 Finalize sua resposta com a frase: **"Fim da resposta."**
 
-✍️ Responda em até 3 parágrafos, priorizando qualidade e clareza.
+✍️ Redija agora a resposta com base nas instruções acima:
 """
 
-
-        resposta = llm(
+        resposta_raw = llm(
             prompt,
-            max_tokens=512,
+            max_tokens=2048,
             temperature=0.4,
             top_p=0.8,
-            repeat_penalty=1.4,
-            presence_penalty=0.6
+            repeat_penalty=1.8,  # penalização forte para evitar repetição
+            presence_penalty=1.0
         )["choices"][0]["text"].strip()
 
-        logger.info(f"🧠 Resposta gerada: {resposta}")
-        return {"answer": resposta}
+        # Pós-processamento: remover linhas duplicadas
+        linhas_unicas = list(dict.fromkeys(resposta_raw.splitlines()))
+        resposta_final = "\n".join(linhas_unicas).strip()
+
+        logger.info(f"🧠 Resposta gerada: {resposta_final}")
+        return {"answer": resposta_final}
 
     except Exception:
         logger.error("Erro no LLM: %s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Erro ao processar a pergunta.")
+
 
 
 # Endpoint para upload de conhecimento
