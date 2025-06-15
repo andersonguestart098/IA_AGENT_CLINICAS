@@ -6,13 +6,10 @@ import io
 from functools import lru_cache
 from transformers import AutoTokenizer
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from llama_cpp import Llama
 from prisma import Prisma
-from datetime import datetime
 from pathlib import Path
 import pytesseract
 from PIL import Image
@@ -22,8 +19,19 @@ import pdfplumber
 from pdf2image import convert_from_bytes
 from dotenv import load_dotenv
 import json
+import faiss
+from sklearn.preprocessing import normalize
+from passlib.context import CryptContext
+import secrets
+import requests
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request
+import datetime
+import torch
+from sentence_transformers import SentenceTransformer
+from collections import defaultdict
 import asyncio
-from models.embeddings import gerar_embedding
+import time
 
 # Carregar variáveis de ambiente
 load_dotenv()
@@ -31,8 +39,8 @@ load_dotenv()
 # Configurar o Prisma
 prisma = Prisma(auto_register=True)
 
-# Configurar o DATABASE_URL diretamente (ajuste o caminho se necessário)
-os.environ["DATABASE_URL"] = "file:D:/IA2/CEMEAR-IA-FIX/prisma/dev.db"
+# Configurar o DATABASE_URL diretamente
+os.environ["DATABASE_URL"] = "file:./prisma/dev.db"
 
 # Criar diretórios
 Path("uploads").mkdir(parents=True, exist_ok=True)
@@ -55,23 +63,575 @@ logger = logging.getLogger(__name__)
 # Inicializar o FastAPI
 app = FastAPI()
 
-# Inicializar o LLM
-llm = Llama(
-    model_path="D:/huggingface_cache/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
-    n_ctx=4096,
-    n_gpu_layers=100,
-    n_threads=16,
-    n_batch=512,
-    use_mlock=True,
-    f16_kv=True,
-    verbose=True
+# Configurações da API Mistral
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+
+WPP_RAW_TOKEN = os.getenv("WPP_TOKEN")
+
+NUMERO_GESTOR = os.getenv("WPP_GESTOR_VENDAS")
+
+# Teste de saída
+print(f"🔑 CHAVE MISTRAL: {MISTRAL_API_KEY[:8]}...")  # só os primeiros dígitos
+if not MISTRAL_API_KEY:
+    raise ValueError("❌ A variável MISTRAL_API_KEY não foi carregada.")
+
+MISTRAL_MODEL = "mistral-large-latest"  # ou o modelo que você está usando
+
+# Habilitar CORS para permitir acesso do frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # frontend React
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+fila_usuarios = defaultdict(asyncio.Queue)      # Fila de mensagens por telefone
+locks_usuarios = defaultdict(asyncio.Lock)      # Lock por telefone (1 mensagem por vez)
+
+# Modelo para embeddings
+embedding_model = None
+
+def load_embedding_model():
+    """Carrega o modelo de embeddings."""
+    global embedding_model
+    try:
+        if embedding_model is None:
+            logger.info("🔄 Carregando modelo de embeddings...")
+            embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("✅ Modelo de embeddings carregado com sucesso.")
+        return embedding_model
+    except Exception as e:
+        logger.error(f"❌ Erro ao carregar modelo de embeddings: {e}")
+        raise
+
+def gerar_embedding(texto):
+    """
+    Gera embedding para o texto usando SentenceTransformer.
+    
+    Args:
+        texto: Texto para gerar embedding
+        
+    Returns:
+        String JSON com o vetor de embedding
+    """
+    try:
+        model = load_embedding_model()
+        embedding = model.encode(texto)
+        return json.dumps(embedding.tolist())
+    except Exception as e:
+        logger.error(f"❌ Erro ao gerar embedding: {e}")
+        raise
+
+def mensagem_inicial_simples(texto: str) -> bool:
+    texto = texto.strip().lower()
+    return texto in {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "tudo bem?", "e aí", "oie", "opa"}
+
+
+def precisa_atendimento_humano(mensagem, resultados_filtrados, intencao=None):
+    """
+    Determina se a consulta deve ser encaminhada para atendimento humano.
+    Versão corrigida para evitar encaminhamentos desnecessários.
+    
+    Args:
+        mensagem: Texto da pergunta do usuário
+        resultados_filtrados: Lista de tuplas (documento, score) encontrados
+        intencao: Classificação da intenção da pergunta (opcional)
+        
+    Returns:
+        Boolean indicando se precisa de atendimento humano
+    """
+    # Perguntas simples comuns que nunca devem ser encaminhadas
+    perguntas_simples = [
+        "horário", "horario", "atendimento", "funcionamento", 
+        "aberto", "fechado", "sábado", "sabado", "domingo", 
+        "endereço", "endereco", "localização", "localizacao",
+        "onde fica", "trabalha com", "produto", "piso", "vinílico", "vinilico",
+        "laminado", "vaga", "emprego", "currículo", "curriculo"
+    ]
+    
+    # Verificar se é uma pergunta simples
+    mensagem_lower = mensagem.lower()
+    for termo in perguntas_simples:
+        if termo in mensagem_lower:
+            # Se for pergunta simples e tiver qualquer documento, não encaminhar
+            if resultados_filtrados:
+                logger.info(f"✅ Pergunta simples sobre '{termo}' com documento encontrado, respondendo automaticamente")
+                return False
+    
+    # Palavras-chave que indicam necessidade de atendimento humano
+    palavras_chave = [
+        "reclamação", "problema", "insatisfeito", "erro", "defeito",
+        "garantia", "devolução", "reembolso", "desconto", "negociar",
+        "gerente", "supervisor", "atendente humano", "falar com pessoa"
+    ]
+    
+    # Verificar se a mensagem contém palavras-chave de reclamação
+    for palavra in palavras_chave:
+        if palavra in mensagem_lower:
+            logger.info(f"🔄 Encaminhando para humano: palavra-chave '{palavra}' detectada")
+            return True
+    
+    # Verificar se a intenção é reclamação
+    if intencao == "RECLAMACAO":
+        logger.info(f"🔄 Encaminhando para humano: intenção classificada como RECLAMACAO")
+        return True
+    
+    # Verificar se não há documentos relevantes
+    if not resultados_filtrados:
+        logger.info("🔄 Encaminhando para humano: nenhum documento relevante")
+        return True
+    
+    # Verificar se a similaridade é extremamente baixa (apenas para casos não cobertos acima)
+    # Threshold reduzido para evitar encaminhamentos desnecessários
+    if resultados_filtrados and resultados_filtrados[0][1] < 0.2:
+        logger.info(f"🔄 Encaminhando para humano: similaridade muito baixa ({resultados_filtrados[0][1]:.2f})")
+        return True
+    
+    return False
+
+
+def chamar_mistral_api(prompt: str, temperature: float = 0.3, max_tokens: int = 300, system_override: str = None) -> str:
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    system_prompt = system_override or (
+        "Você é um atendente técnico da Cemear..."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt}
+    ]
+
+    # Criação dinâmica do corpo da requisição
+    body = {
+        "model": MISTRAL_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+
+    # ✅ Apenas quando está usando sampling (não é greedy)
+    if temperature > 0.0:
+        body["top_p"] = 0.95
+
+    for tentativa in range(5):
+        try:
+            logger.info(f"🔄 Tentativa {tentativa+1} | Requisição para Mistral (temp={temperature}, max_tokens={max_tokens})")
+
+            res = requests.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers=headers,
+                json=body,
+                timeout=30
+            )
+
+            if res.status_code == 429:
+                logger.warning("⏳ Limite de requisições (429). Aguardando para retry...")
+                time.sleep(2 + tentativa * 2)
+                continue
+
+            if res.status_code == 400:
+                logger.error(f"❌ Erro 400 (Bad Request). Prompt:\n{prompt[:300]}...")
+                return "OUTRO"
+
+            res.raise_for_status()
+
+            resposta_bruta = res.json()
+            conteudo = resposta_bruta.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+            if not conteudo:
+                raise Exception("Resposta vazia.")
+
+            return conteudo
+
+        except Exception as e:
+            logger.error(f"❌ Erro inesperado na chamada da Mistral API: {e}")
+            time.sleep(2 + tentativa * 2)
+
+    logger.error("❌ Falha após múltiplas tentativas com a Mistral API.")
+    return "Estamos enfrentando instabilidade momentânea. Por favor, tente novamente em breve."
+
+
+def classificar_intencao_mistral(pergunta: str) -> str:
+    if not pergunta or not pergunta.strip():
+        logger.warning("⚠️ Pergunta vazia na classificação de intenção.")
+        return "OUTRO"
+
+    pergunta = pergunta.strip()
+
+    system_prompt = (
+        "Você é um classificador de intenção de mensagens no WhatsApp.\n"
+        "Responda sempre com apenas UMA das seguintes palavras, em letras MAIÚSCULAS e sem explicações:\n"
+        "SAUDACAO, INFORMACAO_TECNICA, ATENDIMENTO_REGIAO, ORCAMENTO, VAGAS, ELOGIO, RECLAMACAO, OUTRO"
+    )
+
+    user_prompt = f"Mensagem: {pergunta}\nQual a intenção principal?"
+
+    try:
+        resposta = chamar_mistral_api(
+            prompt=user_prompt,
+            temperature=0.0,
+            max_tokens=5,
+            system_override=system_prompt
+        )
+
+        resposta = resposta.upper().strip()
+        logger.info(f"🧠 Mistral retornou intenção: '{resposta}'")
+
+        categorias_validas = {
+            "SAUDACAO", "INFORMACAO_TECNICA", "ATENDIMENTO_REGIAO",
+            "ORCAMENTO", "VAGAS", "ELOGIO", "RECLAMACAO", "OUTRO"
+        }
+
+        if resposta in categorias_validas:
+            return resposta
+
+        # Correção bruta se vier com erros pequenos
+        if "ORÇA" in resposta or "COTA" in resposta or "PREÇO" in resposta:
+            return "ORCAMENTO"
+        if "SAUDA" in resposta or "OLÁ" in resposta or "OI" in resposta:
+            return "SAUDACAO"
+        if "TÉCNIC" in resposta or "PRODUTO" in resposta or "INFO" in resposta:
+            return "INFORMACAO_TECNICA"
+        if "REGI" in resposta or "LOCAL" in resposta:
+            return "ATENDIMENTO_REGIAO"
+        if "VAGA" in resposta or "TRABALHO" in resposta:
+            return "VAGAS"
+        if "ELOGI" in resposta or "PARABÉNS" in resposta:
+            return "ELOGIO"
+        if "RECLAM" in resposta or "PROBLEMA" in resposta or "ERRO" in resposta:
+            return "RECLAMACAO"
+
+        logger.warning(f"⚠️ Resposta inesperada: {resposta}")
+        return "OUTRO"
+
+    except Exception as e:
+        logger.error(f"❌ Erro na classificação de intenção: {e}")
+        return "OUTRO"
+
+
+async def processar_mensagem_whatsapp(dados: dict):
+    try:
+        if not prisma.is_connected():
+            await prisma.connect()
+
+        telefone = dados.get("from")
+        mensagem = dados.get("content") or dados.get("body") or dados.get("message", {}).get("text", "") or ""
+        nome = dados.get("notifyName") or dados.get("contact", {}).get("name", "")
+        session = dados.get("session") or os.getenv("WPP_SESSION") or "NERDWHATS_AMERICA"
+
+        if telefone.endswith("@c.us"):
+            telefone = telefone.replace("@c.us", "")
+
+        if not mensagem.strip():
+            return
+
+        fluxo = await prisma.fluxoconversa.find_first(
+            where={"telefone": telefone, "status": "em_andamento"}
+        )
+
+        if not fluxo:
+            fluxo = await prisma.fluxoconversa.create(
+                data={
+                    "telefone": telefone,
+                    "sessionId": session,
+                    "userId": telefone,
+                    "etapaAtual": "inicio",
+                    "dadosParciais": "[]",
+                    "tipoFluxo": "whatsapp",
+                    "status": "em_andamento"
+                }
+            )
+
+        try:
+            historico = json.loads(fluxo.dadosParciais)
+            if not isinstance(historico, list):
+                historico = []
+        except json.JSONDecodeError:
+            historico = []
+
+        mensagem_limpa = mensagem.strip().lower()
+
+        def mensagem_inicial_simples(texto: str) -> bool:
+            texto = texto.strip().lower()
+            return texto in {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "tudo bem?", "e aí", "oie", "opa"}
+
+        if mensagem_inicial_simples(mensagem):
+            resposta = "Olá! Seja bem-vindo à Cemear. Meu nome é Cemy, como posso te ajudar?"
+            
+            historico.append({
+                "tipo": "entrada",
+                "conteudo": mensagem,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            })
+
+            historico.append({
+                "tipo": "saida",
+                "conteudo": resposta,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            })
+
+            await prisma.fluxoconversa.update(
+                where={"id": fluxo.id},
+                data={"dadosParciais": json.dumps(historico, ensure_ascii=False)}
+            )
+
+            token = get_token_dinamico()
+            if not token:
+                logger.error("❌ Token WPP inválido.")
+                return
+
+            headers = {
+                "Authorization": f"Bearer {token.strip()}",
+                "Content-Type": "application/json"
+            }
+
+            payload = {
+                "phone": telefone,
+                "message": resposta,
+                "isGroup": False
+            }
+
+            envio = requests.post(
+                f"http://wpp-server:21465/api/{session}/send-message",
+                json=payload,
+                headers=headers,
+                timeout=10
+            )
+
+            logger.info(f"📤 Saudação simples respondida. Status envio: {envio.status_code}")
+            return
+
+        historico.append({
+            "tipo": "entrada",
+            "conteudo": mensagem,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        })
+
+        contexto_historico = ""
+        if historico:
+            recent_messages = historico[-5:]
+            contexto_historico = "HISTÓRICO RECENTE:\n" + "\n".join([
+                f"{'Usuário' if msg['tipo'] == 'entrada' else 'Cemear'}: {msg['conteudo']}"
+                for msg in recent_messages
+            ]) + "\n\n"
+
+        resposta = ""
+        if faiss_index.ntotal == 0 or not faiss_docs:
+            resposta = "No momento, a base de conhecimento está indisponível. Por favor, tente novamente mais tarde."
+        else:
+            intencao = classificar_intencao_mistral(mensagem)
+            logger.info(f"🧠 Intenção classificada: {intencao}")
+
+            if intencao == "RECLAMACAO":
+                resposta = "Lamento pelo ocorrido. Um de nossos atendentes entrará em contato em breve."
+                await prisma.fluxoconversa.update(
+                    where={"id": fluxo.id},
+                    data={"etapaAtual": "aguardando_humano"}
+                )
+
+            elif intencao == "ORCAMENTO":
+                resposta = "Certo! Encaminharei suas informações para um de nossos consultores. Aguarde o contato. 👍"
+
+                logger.info(f"📨 Enviando lead para gestor via notificar_gestor_contato...")
+                resultado_envio = await asyncio.to_thread(notificar_gestor_contato, telefone, mensagem, nome)
+                logger.info(f"📨 Resultado envio ao gestor: {'✅ SUCESSO' if resultado_envio else '❌ FALHA'}")
+
+                await prisma.fluxoconversa.update(
+                    where={"id": fluxo.id},
+                    data={"etapaAtual": "aguardando_vendedor"}
+                )
+
+            else:
+                emb_pergunta = np.array(json.loads(gerar_embedding(mensagem)), dtype=np.float32).reshape(1, -1)
+                emb_pergunta = normalize(emb_pergunta, axis=1)
+                k = min(1, faiss_index.ntotal)
+                D, I = faiss_index.search(emb_pergunta, k)
+                resultados = []
+                for i, score in zip(I[0], D[0]):
+                    if i == -1 or i >= len(id_map): continue
+                    doc_id = id_map[i]
+                    doc = next((d for d in faiss_docs if d.id == doc_id), None)
+                    if doc:
+                        resultados.append((doc, float(score)))
+                resultados_filtrados = [(doc, score) for doc, score in resultados if score > 0.3]
+
+                if precisa_atendimento_humano(mensagem, resultados_filtrados, intencao):
+                    resposta = "Sua pergunta requer análise especializada. Um de nossos técnicos entrará em contato."
+                    await prisma.fluxoconversa.update(
+                        where={"id": fluxo.id},
+                        data={"etapaAtual": "aguardando_humano"}
+                    )
+                elif not resultados_filtrados:
+                    resposta = chamar_mistral_api(
+                        mensagem,
+                        system_override=f"""
+                        Você é um atendente técnico da Cemear (pisos vinílicos e laminados).
+
+                        Regras:
+                        - Use no máximo 3 frases curtas.
+                        - Não adicione introduções ou encerramentos.
+                        - Responda com base apenas na pergunta.
+                        - Se não souber, diga: \"Preciso consultar um especialista sobre isso.\"
+
+                        Mensagem do usuário:
+                        {mensagem}
+                        """.strip(),
+                        temperature=0.3,
+                        max_tokens=300
+                    )
+                else:
+                    contexto = resultados_filtrados[0][0].conteudo
+                    resposta = chamar_mistral_api(
+                        mensagem,
+                        system_override=f"""
+                        Você é um atendente técnico da Cemear (pisos vinílicos e laminados).
+
+                        Regras:
+                        - Use no máximo 3 frases curtas.
+                        - Responda APENAS com informações do documento.
+                        - Não adicione introduções ou encerramentos.
+                        - Linguagem direta e profissional.
+                        - Se não souber, diga: \"Preciso consultar um especialista sobre isso.\"
+
+                        {contexto_historico}
+
+                        DOCUMENTO:
+                        {contexto}
+
+                        PERGUNTA:
+                        {mensagem}
+                        """.strip(),
+                        temperature=0.3,
+                        max_tokens=300
+                    )
+
+        resposta = resposta.strip() if resposta else "Não consegui processar sua pergunta. Pode reformular?"
+
+        historico.append({
+            "tipo": "saida",
+            "conteudo": resposta,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        })
+
+        await prisma.fluxoconversa.update(
+            where={"id": fluxo.id},
+            data={"dadosParciais": json.dumps(historico, ensure_ascii=False)}
+        )
+
+        token = get_token_dinamico()
+        if not token:
+            logger.error("❌ Token WPP inválido.")
+            return
+
+        headers = {
+            "Authorization": f"Bearer {token.strip()}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "phone": telefone,
+            "message": resposta,
+            "isGroup": False
+        }
+
+        envio = requests.post(
+            f"http://wpp-server:21465/api/{session}/send-message",
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+
+        logger.info(f"📤 Envio WhatsApp status {envio.status_code}")
+
+    except Exception as e:
+        logger.error(f"❌ Erro no processamento WhatsApp:\n{traceback.format_exc()}")
+
+async def processar_fila_usuario(telefone):
+    if locks_usuarios[telefone].locked():
+        return  # já está sendo processado
+
+    async with locks_usuarios[telefone]:
+        while not fila_usuarios[telefone].empty():
+            dados = await fila_usuarios[telefone].get()
+            try:
+                logger.info(f"🚀 Processando mensagem de {telefone}")
+                await processar_mensagem_whatsapp(dados)
+            except Exception as e:
+                logger.error(f"❌ Erro ao processar fila de {telefone}: {e}")
+
+
+def notificar_gestor_contato(telefone_cliente: str, mensagem_cliente: str, nome_cliente: str = "") -> bool:
+    """
+    Envia notificação para o gestor de vendas com os dados do lead.
+    """
+    try:
+        from datetime import datetime
+
+        token = get_token_dinamico()
+        if not token:
+            logger.error("❌ Token WPP dinâmico não gerado.")
+            return False
+
+        WPP_SESSION = os.getenv("WPP_SESSION", "NERDWHATS_AMERICA")
+        WPP_GESTOR = os.getenv("WPP_GESTOR_VENDAS")
+        WPP_SERVER = os.getenv("WPP_SERVER_URL", "http://wpp-server:21465")  # default interno
+
+        if not WPP_GESTOR:
+            logger.error("❌ Número do gestor (WPP_GESTOR_VENDAS) não configurado no .env.")
+            return False
+
+        numero_cliente_formatado = telefone_cliente.replace("@c.us", "")
+        nome_formatado = nome_cliente or "Nome não informado"
+        hora = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+        mensagem = (
+            f"📩 *NOVO LEAD DE ORÇAMENTO - IA CEMEAR*\n\n"
+            f"👤 Nome: *{nome_formatado}*\n"
+            f"📱 Telefone: *{numero_cliente_formatado}*\n"
+            f"⏰ Data/Hora: {hora}\n\n"
+            f"💬 *Mensagem:*\n_{mensagem_cliente.strip()[:300]}_\n\n"
+            f"⚠️ Contato encaminhado pela IA. Por favor, responder o quanto antes."
+        )
+
+        headers = {
+            "Authorization": f"Bearer {token.strip()}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "phone": WPP_GESTOR,
+            "message": mensagem,
+            "isGroup": False
+        }
+
+        url = f"{WPP_SERVER}/api/{WPP_SESSION}/send-message"
+        logger.info(f"📨 Enviando lead para gestor {WPP_GESTOR} via {url}")
+
+        res = requests.post(url, json=payload, headers=headers, timeout=15)
+
+        if res.status_code in [200, 201]:
+            logger.info("✅ Lead enviado com sucesso para o gestor de vendas.")
+            return True
+        else:
+            logger.error(f"❌ Erro HTTP {res.status_code} ao enviar lead: {res.text}")
+            return False
+
+    except Exception as e:
+        logger.error(f"❌ Erro ao enviar notificação de lead: {e}")
+        return False
+
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
 # Função para extrair texto de arquivos
 async def extrair_texto(content: bytes, file: UploadFile) -> str:
+    """Extrai texto de diferentes tipos de arquivo."""
     texto = ""
     file_ext = Path(file.filename).suffix.lower()
     content_type = file.content_type or mimetypes.guess_type(file.filename)[0] or ""
@@ -89,30 +649,29 @@ async def extrair_texto(content: bytes, file: UploadFile) -> str:
                 texto += pytesseract.image_to_string(image)
     return texto
 
-# Função para truncar contexto com base em tokens
-def truncate_context(documents, max_tokens=1500):
-    context = ""
-    current_tokens = 0
-    for doc in documents:
-        doc_text = f"- {doc}\n\n"
-        doc_tokens = len(tokenizer.encode(doc_text))
-        if current_tokens + doc_tokens > max_tokens:
-            remaining_tokens = max_tokens - current_tokens
-            truncated_doc = tokenizer.decode(tokenizer.encode(doc_text)[:remaining_tokens])
-            context += truncated_doc
-            break
-        context += doc_text
-        current_tokens += doc_tokens
-    return context.strip()
+def get_token_dinamico():
+    session = os.getenv("WPP_SESSION")
+    secret = os.getenv("WPP_SECRET_KEY")  # você pode adicionar isso ao .env
 
-# Cache para geração de embeddings
-@lru_cache(maxsize=1000)
-def cached_gerar_embedding(question: str) -> str:
-    return gerar_embedding(question)
+    url = f"http://wpp-server:21465/api/{session}/{secret}/generate-token"
+    try:
+        res = requests.post(url)
+        res.raise_for_status()
+        data = res.json()
+        return data.get("token")
+    except Exception as e:
+        logger.error(f"❌ Erro ao buscar token dinâmico: {e}")
+        return None
 
-# Eventos de inicialização e encerramento
+
+# FAISS com produto interno (ideal para vetores normalizados)
+faiss_index = faiss.IndexFlatIP(384)  # 384 = dimensão do embedding
+id_map = {}
+faiss_docs = []
+
 @app.on_event("startup")
 async def startup():
+    """Inicialização da aplicação."""
     await prisma.connect()
     logger.info("✅ Prisma conectado com sucesso.")
     try:
@@ -120,8 +679,45 @@ async def startup():
     except Exception:
         logger.warning("⚠️ Não foi possível identificar o caminho do banco.")
 
+    # Carregar modelo de embeddings
+    load_embedding_model()
+
+    # Limpar índice FAISS existente
+    global faiss_index, id_map, faiss_docs
+    faiss_index = faiss.IndexFlatIP(384)  # Reinicializar o índice
+    id_map = {}
+    faiss_docs = []
+
+    # Construir índice FAISS com documento consolidado
+    try:
+        # Buscar o documento consolidado pelo nome do arquivo
+        documento = await prisma.knowledgebase.find_first(
+            where={"origem": "cemear_base_conhecimento_consolidada.txt"}
+        )
+        
+        if not documento:
+            logger.warning("⚠️ Documento consolidado não encontrado, usando todos os documentos.")
+            documentos = await prisma.knowledgebase.find_many(where={"embedding": {"not": None}})
+        else:
+            documentos = [documento]
+            logger.info(f"✅ Usando documento consolidado ID {documento.id}")
+        
+        for idx, doc in enumerate(documentos):
+            try:
+                vetor = np.array(json.loads(doc.embedding), dtype=np.float32).reshape(1, -1)
+                vetor_normalizado = normalize(vetor, axis=1)
+                faiss_index.add(vetor_normalizado)
+                id_map[idx] = doc.id
+                faiss_docs.append(doc)
+            except Exception as e:
+                logger.warning(f"⚠️ Erro ao adicionar embedding ID {doc.id} ao FAISS: {e}")
+        logger.info(f"📌 FAISS carregado com {len(faiss_docs)} documentos normalizados.")
+    except Exception as e:
+        logger.error(f"❌ Erro ao carregar FAISS no startup: {e}")
+
 @app.on_event("shutdown")
 async def shutdown():
+    """Desconexão ao desligar a aplicação."""
     await prisma.disconnect()
     logger.info("🔕 Prisma desconectado.")
 
@@ -129,115 +725,100 @@ async def shutdown():
 class PromptRequest(BaseModel):
     question: str
 
-# Endpoint de chat
-@app.post("/chat")
-async def chat_endpoint(data: PromptRequest):
+@app.post("/chat-atendente")
+async def chat_atendente(data: PromptRequest):
+    """Endpoint principal para chat com o atendente virtual."""
     try:
-        if not data.question or len(data.question.strip()) < 3:
-            logger.warning("⚠️ Pergunta inválida recebida.")
-            return {"answer": "Por favor, envie uma pergunta válida.\nFim da resposta."}
+        if not prisma.is_connected():
+            await prisma.connect()
 
-        logger.info(f"🤖 Pergunta recebida no /chat: {data.question}")
+        pergunta = data.question.strip()
+        if not pergunta:
+            raise HTTPException(400, "Mensagem vazia.")
 
-        # Buscar todos os documentos com embeddings
-        for attempt in range(3):
-            try:
-                todos = await prisma.knowledgebase.find_many(where={"embedding": {"not": None}})
-                break
-            except Exception as e:
-                logger.warning(f"⚠️ Tentativa {attempt + 1} falhou: {e}")
-                if attempt == 2:
-                    raise HTTPException(status_code=500, detail="Erro ao acessar o banco de dados.")
-                await asyncio.sleep(1)
+        logger.info(f"📥 Pergunta recebida: {pergunta}")
 
-        if not todos:
-            logger.info("⚠️ Nenhum documento com embedding encontrado.")
-            return {"answer": "Não encontrei essa informação nos documentos técnicos.\nFim da resposta."}
+        # 👋 Saudações simples: responde direto sem IA
+        if mensagem_inicial_simples(pergunta):
+            resposta = "Olá! Tudo bem? Como posso te ajudar?"
+            logger.info("🤖 Resposta rápida para saudação simples.")
+            return {"answer": resposta}
 
-        # Gerar embedding da pergunta
-        embedding_pergunta = np.array(json.loads(cached_gerar_embedding(data.question))).reshape(1, -1)
+        # 🔎 Etapa 1: Classificação de intenção
+        intencao = classificar_intencao_mistral(pergunta)
+        logger.info(f"🧠 Intenção classificada: {intencao}")
 
-        embeddings = []
-        metadata = []
-        for k in todos:
-            try:
-                vetor = np.array(json.loads(k.embedding)).reshape(1, -1)
-                embeddings.append(vetor)
-                metadata.append(k)
-            except Exception as e:
-                logger.warning(f"⚠️ Erro ao processar embedding ID {k.id}: {e}")
+        if intencao == "SAUDACAO":
+            return {"answer": "Olá! Como posso ajudar?"}
+        elif intencao == "ELOGIO":
+            return {"answer": "Obrigado pelo feedback! Estamos à disposição."}
+        elif intencao == "RECLAMACAO":
+            return {
+                "answer": "Lamento pelo ocorrido. Vou transferir para um atendente especializado resolver sua questão.",
+                "encaminhar_humano": True
+            }
+        elif intencao == "ORCAMENTO":
+            return {
+                "answer": "Certo! Encaminharei suas informações para um de nossos consultores. Aguarde o contato. 👍",
+                "encaminhar_vendedor": True
+            }
+
+        # 🔍 Etapa 2: Verificação da base de conhecimento
+        if faiss_index.ntotal == 0 or not faiss_docs:
+            return {"answer": "Base de conhecimento indisponível no momento."}
+
+        emb_pergunta = np.array(json.loads(gerar_embedding(pergunta)), dtype=np.float32).reshape(1, -1)
+        emb_pergunta = normalize(emb_pergunta, axis=1)
+
+        k = min(1, faiss_index.ntotal)
+        D, I = faiss_index.search(emb_pergunta, k)
+
+        resultados = []
+        for i, score in zip(I[0], D[0]):
+            if i == -1 or i >= len(id_map):
                 continue
+            doc_id = id_map[i]
+            doc = next((d for d in faiss_docs if d.id == doc_id), None)
+            if doc:
+                resultados.append((doc, float(score)))
 
-        if not embeddings or not metadata:
-            logger.warning("⚠️ Nenhum embedding utilizável.")
-            return {"answer": "Não encontrei essa informação nos documentos técnicos.\nFim da resposta."}
+        resultados_filtrados = [(doc, score) for doc, score in resultados if score > 0.3]
 
-        # Similaridade entre pergunta e base
-        embeddings_stack = np.vstack(embeddings)
-        scores = cosine_similarity(embedding_pergunta, embeddings_stack)[0]
+        if precisa_atendimento_humano(pergunta, resultados_filtrados, intencao):
+            return {
+                "answer": "Sua pergunta requer análise especializada. Vou transferir para um de nossos técnicos.",
+                "encaminhar_humano": True
+            }
 
-        # Ordenar por similaridade
-        relevantes = [(metadata[i], score) for i, score in enumerate(scores)]
-        top_relevantes = sorted(relevantes, key=lambda x: x[1], reverse=True)
-        top_validos = [r for r in top_relevantes if r[1] >= 0.4][:5]  # Limiar mais tolerante
+        if not resultados_filtrados:
+            return {"answer": "Não encontrei essa informação nos documentos técnicos."}
 
-        if not top_validos:
-            logger.info("⚠️ Nenhuma similaridade relevante encontrada.")
-            return {"answer": "Não encontrei essa informação nos documentos técnicos.\nFim da resposta."}
-
-        # Log de documentos usados
-        for k, score in top_validos:
-            logger.info(f"🧩 ID: {k.id} | Score: {round(score, 4)} | Origem: {k.origem}")
-
-        # Construção do prompt baseado nos melhores documentos
-        documentos = '\n'.join(f"- (Score: {round(score, 4)}) {k.conteudo.strip()}" for k, score in top_validos)
+        contexto = resultados_filtrados[0][0].conteudo
 
         prompt = f"""
-Você é um assistente técnico da empresa Cemear.
+Responda com base apenas no documento abaixo.
+Use no máximo 3 frases curtas e diretas.
+Se não encontrar a resposta, diga apenas: "Preciso consultar um especialista sobre isso."
 
-Responda apenas com base nos documentos técnicos fornecidos abaixo.  
-Priorize informações de documentos com maior pontuação de similaridade.  
-Se os documentos não responderem completamente à pergunta, diga:  
-"Não encontrei essa informação nos documentos técnicos."  
-Finalize sempre com: "Fim da resposta."
+DOCUMENTO:
+{contexto}
 
-📚 Documentos técnicos relevantes:
-{documentos}
-
-❓ Pergunta:
-{data.question}
-
-📝 Resposta:
+PERGUNTA:
+{pergunta}
 """
-
-        resposta_raw = llm(
-            prompt,
-            max_tokens=1024,
-            temperature=0.1,
-            top_p=0.6,
-            repeat_penalty=1.8,
-            presence_penalty=1.0
-        )["choices"][0]["text"].strip()
-
-        resposta_final = resposta_raw
-        if "Fim da resposta" not in resposta_final:
-            resposta_final += "\nFim da resposta."
-
-        if len(resposta_final.strip()) < 10:
-            resposta_final = "Não encontrei essa informação nos documentos técnicos.\nFim da resposta."
-
-        logger.info(f"🧠 Resposta final: {resposta_final}")
-        return {"answer": resposta_final}
+        resposta = chamar_mistral_api(prompt, temperature=0.3, max_tokens=300)
+        return {"answer": resposta}
 
     except Exception:
-        logger.error("Erro no LLM: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Erro ao processar a pergunta.")
+        logger.error("❌ Erro no /chat-atendente:\n%s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Erro interno ao processar atendimento.")
 
 
-
-# Endpoint para upload de conhecimento
 @app.post("/upload")
 async def upload_conhecimento(file: UploadFile = File(...)):
+    """
+    Endpoint para upload de documentos para a base de conhecimento.
+    """
     try:
         content = await file.read()
         file_ext = Path(file.filename).suffix.lower()
@@ -254,345 +835,37 @@ async def upload_conhecimento(file: UploadFile = File(...)):
             "embedding": embedding_json
         })
 
+        logger.info(f"✅ Documento '{file.filename}' adicionado com ID {kb.id}")
         return {"status": "sucesso", "resumo": texto[:200], "id": kb.id}
     except Exception:
-        logger.error("Erro ao salvar conhecimento: %s", traceback.format_exc())
+        logger.error("❌ Erro ao salvar conhecimento: %s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Erro interno ao processar o upload.")
 
-
-# Endpoint para upload de planta
-@app.post("/upload-planta")
-async def upload_planta(file: UploadFile = File(...), contexto: str = Form("")):
+@app.post("/whatsapp-webhook")
+async def whatsapp_webhook(request: Request):
     try:
-        content = await file.read()
-        texto = await extrair_texto(content, file)
-        if not texto.strip():
-            raise HTTPException(status_code=422, detail="Não foi possível extrair texto da planta.")
+        dados = await request.json()
+        telefone = dados.get("from")
 
-        largura, altura = 5.0, 3.0  # Valores fixos como exemplo
-        area = largura * altura
-        materiais = {
-            "area_total_m2": round(area, 2),
-            "perimetro_total_m": round(2 * (largura + altura), 2),
-            "montantes": int(area * 2),
-            "guias": int(largura * 2),
-            "placas_gesso": int(area / 1.8),
-            "parafusos": int(area * 15),
-            "fitas": int(area / 50),
-            "massa": int(area / 20)
-        }
+        if not telefone or not dados.get("content"):
+            return {"status": "ignorado"}
 
-        prompt = f"""
-Você é um engenheiro da Cemear.
+        # Remover sufixo "@c.us" se existir
+        if telefone.endswith("@c.us"):
+            telefone = telefone.replace("@c.us", "")
 
-Contexto:
-{contexto}
+        # Adicionar a mensagem à fila
+        await fila_usuarios[telefone].put(dados)
+        logger.info(f"📥 Mensagem de {telefone} enfileirada.")
 
-Texto da planta:
-{texto[:1200]}...
+        # Iniciar processamento da fila se não estiver em execução
+        asyncio.create_task(processar_fila_usuario(telefone))
 
-Gere uma resposta técnica com materiais estimados.
-"""
-        resposta = llm(prompt, max_tokens=1024, temperature=0.7, top_p=0.9)["choices"][0]["text"].strip()
-        kb = await prisma.knowledgebase.create({"origem": file.filename, "conteudo": texto})
-
-        return {
-            "status": "sucesso",
-            "materiais_estimados": materiais,
-            "medidas_detectadas": {"largura_metros": largura, "altura_metros": altura},
-            "resposta_ia": resposta,
-            "resumo": texto[:200],
-            "knowledgeBaseId": kb.id
-        }
-    except Exception:
-        logger.error("Erro ao processar planta: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Erro interno ao processar a planta.")
-
-# Endpoint para interpretação de upload
-@app.post("/upload-interpreta")
-async def upload_interpreta(file: UploadFile = File(...), contexto: str = Form("")):
-    try:
-        content = await file.read()
-        texto = await extrair_texto(content, file)
-        if not texto.strip() and not contexto.strip():
-            raise HTTPException(status_code=422, detail="Não foi possível interpretar nada.")
-
-        prompt = (
-            f"O usuário disse: {contexto}\nArquivo: {texto[:1200]}" 
-            if texto and contexto 
-            else (f"Conteúdo do arquivo: {texto[:1200]}" if texto else f"Contexto do usuário: {contexto}")
-        )
-        resposta = llm(prompt, max_tokens=1024, temperature=0.7, top_p=0.9)["choices"][0]["text"].strip()
-
-        return {"status": "sucesso", "resposta_ia": resposta, "resumo": texto[:200] if texto else contexto[:200]}
-    except Exception:
-        logger.error("Erro ao interpretar: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Erro interno ao interpretar.")
-    
-@app.post("/calcular-materiais")
-async def calcular_materiais_manualmente(
-    area: float = Form(...),
-    perimetro: float = Form(...),
-    altura_rebaixo: float = Form(0.4),
-    contexto: str = Form("")
-):
-    from math import ceil
-
-    try:
-        logger.info(f"📐 Cálculo manual solicitado - Área: {area}, Perímetro: {perimetro}, Rebaixo: {altura_rebaixo}")
-        logger.info(f"📝 Contexto: {contexto}")
-
-        # Cálculos técnicos
-        f530 = (area * 1.8) / 3
-        massa = area * 0.55
-        fita = (area * 1.5) / 150
-        gn25 = area * 16
-        cantoneira = (perimetro * 1.05) / 3
-        pendural = f530 * 3
-        arame10 = (pendural * altura_rebaixo) / 14
-        parafuso_bucha = (cantoneira * 6) + pendural
-        parafuso_13mm_pa = f530 * 2
-
-        # Resposta com base no contexto
-        contexto_lower = contexto.lower()
-
-        if "f530" in contexto_lower or "montante" in contexto_lower:
-            resposta = f"Com base na área e perímetro fornecidos, a quantidade estimada de montantes F530 é de {ceil(f530)} barras de 3 metros."
-        elif "massa" in contexto_lower:
-            resposta = f"Com base na área fornecida, a quantidade estimada de massa é de {massa:.2f} kg."
-        elif "fita" in contexto_lower:
-            resposta = f"Com base na área fornecida, a quantidade estimada de fita de papel é de {ceil(fita)} rolos."
-        elif "gn25" in contexto_lower:
-            resposta = f"Com base na área fornecida, a quantidade estimada de parafusos GN25 é de {int(gn25)} unidades."
-        elif "cantoneira" in contexto_lower:
-            resposta = f"Com base no perímetro fornecido, a quantidade estimada de cantoneiras tabica é de {ceil(cantoneira)} barras de 3 metros."
-        elif "pendural" in contexto_lower:
-            resposta = f"Com base na área fornecida, a quantidade estimada de pendurais é de {ceil(pendural)} unidades."
-        elif "arame" in contexto_lower:
-            resposta = f"Com base na área e altura do rebaixo, a quantidade estimada de arame 10 é de {arame10:.2f} kg."
-        elif "bucha" in contexto_lower:
-            resposta = f"Com base nos cálculos, a quantidade estimada de parafusos com bucha é de {ceil(parafuso_bucha)} unidades."
-        elif "parafuso 13mm" in contexto_lower or "pa" in contexto_lower:
-            resposta = f"Com base na área fornecida, a quantidade estimada de parafusos 13mm PA é de {ceil(parafuso_13mm_pa)} unidades."
-        else:
-            resposta = "Não encontrei essa informação nos documentos técnicos."
-
-        return {
-            "status": "sucesso",
-            "resposta_ia": resposta
-        }
+        return {"status": "em_fila"}
 
     except Exception as e:
-        logger.error(f"Erro no cálculo manual com RAG: {str(e)}")
-        raise HTTPException(status_code=500, detail="Erro ao calcular com base no banco de conhecimento.")
-
-
-
-# Modelo para requisições de feedback
-class FeedbackRequest(BaseModel):
-    question: str
-    answer: str
-    feedback: str
-    contextoUsuario: str = ""
-    origemPlanta: str = ""
-    knowledgeBaseId: int | None = None
-
-# Endpoint para receber feedback
-@app.post("/feedback")
-async def receber_feedback(data: FeedbackRequest):
-    try:
-        # Prompt para classificar feedback com LLaMA
-        prompt_classificacao = f"""
-Classifique o feedback a seguir com base nas regras:
-
-Feedback do usuário:
-"{data.feedback}"
-
-Regras:
-- Se o feedback indicar que a resposta foi correta, diga apenas: ACERTO
-- Se o feedback indicar erro ou insatisfação, diga apenas: ERRO
-- Se for neutro, elogio genérico ou não der pra saber, diga apenas: NEUTRO
-
-IMPORTANTE: Retorne SOMENTE uma destas palavras em MAIÚSCULO: ACERTO, ERRO ou NEUTRO. Sem explicações, sem pontuação, sem prefixo.
-"""
-
-        # Chamada ao LLaMA com temperatura 0 (determinístico)
-        classificacao_raw = llm(
-            prompt_classificacao,
-            max_tokens=5,
-            temperature=0.0
-        )["choices"][0]["text"].strip().upper()
-
-        # Sanitização da saída para detectar a intenção correta
-        if "ACERTO" in classificacao_raw:
-            acerto = True
-            classificacao_final = "ACERTO"
-        elif "ERRO" in classificacao_raw:
-            acerto = False
-            classificacao_final = "ERRO"
-        else:
-            acerto = False
-            classificacao_final = "NEUTRO"
-
-        # Criação do feedback no banco
-        created = await prisma.feedback.create({
-            "question": data.question,
-            "answer": data.answer,
-            "feedback": data.feedback,
-            "acerto": acerto,
-            "contextoUsuario": data.contextoUsuario,
-            "origemPlanta": data.origemPlanta,
-            "knowledgeBaseId": data.knowledgeBaseId
-        })
-
-        logger.info(f"📥 Feedback salvo: ID {created.id} | Classificação: {classificacao_final}")
-        return {"status": "ok", "id": created.id, "classificacao": classificacao_final}
-
-    except Exception as e:
-        logger.error(f"Erro ao salvar feedback: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao salvar feedback: {str(e)}")
-
-
-
-# Endpoint para aprendizado por reforço
-@app.post("/reforco")
-async def aprendizado_reforco():
-    try:
-        feedbacks = await prisma.feedback.find_many(where={"acerto": True, "usada_para_treinamento": False})
-        contador = 0
-
-        for fb in feedbacks:
-            content = f"Pergunta: {fb.question}\nResposta: {fb.answer}"
-            try:
-                embedding_json = gerar_embedding(content)  # gera vetor como string JSON
-                kb = await prisma.knowledgebase.create({
-                    "origem": f"feedback:{fb.id}",
-                    "conteudo": content,
-                    "embedding": embedding_json
-                })
-                await prisma.feedback.update(
-                    where={"id": fb.id},
-                    data={"usada_para_treinamento": True, "knowledgeBaseId": kb.id}
-                )
-                contador += 1
-            except Exception as e:
-                logger.error(f"Erro ao vetorizar feedback {fb.id}: {str(e)}")
-                continue
-
-        logger.info(f"Reforço aplicado em {contador} feedbacks.")
-        return {"status": "reforço aplicado", "quantidade": contador}
-    except Exception:
-        logger.error("Erro no reforço: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Erro ao aplicar reforço.")
-
-# Endpoint para testar feedbacks
-@app.get("/test-feedback")
-async def test_feedback():
-    try:
-        feedbacks = await prisma.feedback.find_many(
-            order={"contextoUsuario": "asc"},
-            take=100,
-            skip=0,
-            include={"knowledgeBase": True}
-        )
-        return {
-            "status": "success",
-            "data": [
-                {
-                    "id": f.id,
-                    "question": f.question,
-                    "answer": f.answer,
-                    "feedback": f.feedback,
-                    "acerto": f.acerto,
-                    "contextoUsuario": f.contextoUsuario,
-                    "origemPlanta": f.origemPlanta,
-                    "knowledgeBase": f.knowledgeBase.conteudo if f.knowledgeBase else None
-                }
-                for f in feedbacks
-            ]
-        }
-    except Exception as e:
-        logger.error(f"Erro ao buscar feedbacks: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar feedbacks: {str(e)}")
-    
-@app.get("/metrics")
-async def gerar_metricas():
-    try:
-        total = await prisma.feedback.count()
-        acertos = await prisma.feedback.count(where={"acerto": True})
-        usados = await prisma.feedback.count(where={"usada_para_treinamento": True})
-
-        taxa = round((acertos / total) * 100, 2) if total else 0
-        usado_pct = round((usados / total) * 100, 2) if total else 0
-
-        ultima = await prisma.metricas.find_first(order={"criadoEm": "desc"})
-
-        # Calcula a evolução se houver registro anterior
-        evolucao_taxa = round(taxa - ultima.taxaAcerto, 2) if ultima else None
-        evolucao_usados = round(usado_pct - ultima.percentualUsado, 2) if ultima else None
-
-        # Salva nova métrica
-        await prisma.metricas.create({
-            "totalFeedbacks": total,
-            "acertos": acertos,
-            "taxaAcerto": taxa,
-            "usadosTreino": usados,
-            "percentualUsado": usado_pct
-        })
-
-        return {
-            "total_feedbacks": total,
-            "acertos": acertos,
-            "taxa_acerto": taxa,
-            "feedbacks_usados": usados,
-            "percentual_usado": usado_pct,
-            "evolucao_taxa_acerto": evolucao_taxa,
-            "evolucao_percentual_usado": evolucao_usados
-        }
-
-    except Exception:
-        logger.error("Erro ao gerar métricas: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Erro ao gerar métricas.")
-    
-@app.get("/dashboard", response_class=HTMLResponse)
-async def exibir_dashboard():
-    total = await prisma.feedback.count()
-    acertos = await prisma.feedback.count(where={"acerto": True})
-    usados = await prisma.feedback.count(where={"usada_para_treinamento": True})
-
-    taxa_acerto = round((acertos / total) * 100, 2) if total else 0
-    percentual_usado = round((usados / total) * 100, 2) if total else 0
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Dashboard IA - Cemear</title>
-        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-    </head>
-    <body class="bg-gray-100 text-gray-800">
-        <div class="container mx-auto p-8">
-            <h1 class="text-3xl font-bold mb-4">📊 Dashboard da IA - Cemear</h1>
-            <div class="grid grid-cols-2 gap-4">
-                <div class="bg-white shadow-md rounded-lg p-6">
-                    <h2 class="text-lg font-semibold">Feedbacks totais</h2>
-                    <p class="text-2xl">{total}</p>
-                </div>
-                <div class="bg-white shadow-md rounded-lg p-6">
-                    <h2 class="text-lg font-semibold">Feedbacks com acerto</h2>
-                    <p class="text-2xl">{acertos} ({taxa_acerto}%)</p>
-                </div>
-                <div class="bg-white shadow-md rounded-lg p-6">
-                    <h2 class="text-lg font-semibold">Usados para treinamento</h2>
-                    <p class="text-2xl">{usados} ({percentual_usado}%)</p>
-                </div>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
-
+        logger.error(f"❌ Erro no webhook WhatsApp:\n{traceback.format_exc()}")
+        return {"status": "erro", "mensagem": str(e)}
 
 # Executar a aplicação
 if __name__ == "__main__":

@@ -13,3 +13,11 @@ pillow
 pandas
 prisma
 python-dotenv
+pdfplumber
+pdf2image
+faiss-cpu
+scikit-learn
+passlib
+requests
+python-multipart
+huggingface_hub[hf_xet]

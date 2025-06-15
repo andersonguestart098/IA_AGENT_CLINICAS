@@ -26,7 +26,7 @@ model KnowledgeBase {
   id        Int         @id @default(autoincrement())
   origem    String
   conteudo  String
-  embedding String?     // Agora é uma string com JSON do vetor
+  embedding String?     
   timestamp DateTime    @default(now())
   feedbacks Feedback[]
 }
@@ -40,3 +40,43 @@ model Metricas {
   percentualUsado Float
   criadoEm        DateTime @default(now())
 }
+
+model Ocorrencia {
+  id        Int      @id @default(autoincrement())
+  tipo      String   
+  mensagem  String
+  userId    String
+  criadoEm  DateTime @default(now())
+}
+
+model Usuario {
+  id         String   @id @default(cuid())
+  nome       String
+  email      String   @unique
+  senhaHash  String
+  criadoEm   DateTime @default(now())
+  sessoes    Sessao[]
+}
+
+model Sessao {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  usuarioId String
+  criadoEm  DateTime @default(now())
+
+  usuario   Usuario @relation(fields: [usuarioId], references: [id])
+}
+
+model FluxoConversa {
+  id            Int      @id @default(autoincrement())
+  telefone      String   // ✅ novo campo para rastrear leads pelo número do WhatsApp
+  sessionId     String
+  userId        String
+  etapaAtual    String
+  dadosParciais String   // <- Armazena JSON serializado
+  tipoFluxo     String
+  status        String   @default("em_andamento")
+  criadoEm      DateTime @default(now())
+}
+
+

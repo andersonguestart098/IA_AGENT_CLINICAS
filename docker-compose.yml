@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  ia-cemear:
+    build:
+      context: .
+    container_name: ia-cemear
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./prisma:/app/prisma
+    environment:
+      - DATABASE_URL=file:/app/prisma/dev.db
+    restart: unless-stopped
+    networks:
+      - cemear-network
+
+  wppconnect:
+    build:
+      context: ./whatsapp
+    container_name: wpp-server
+    ports:
+      - "21465:21465"
+    volumes:
+      - ./whatsapp/config.ts:/usr/src/wpp-server/config.ts
+      - wppconnect_tokens:/usr/src/wpp-server/tokens
+    environment:
+      - WEBHOOK_URL=http://ia-cemear:8000/whatsapp-webhook
+    depends_on:
+      - ia-cemear
+    restart: unless-stopped
+    networks:
+      - cemear-network
+
+volumes:
+  wppconnect_tokens: {}
+
+networks:
+  cemear-network:
+    driver: bridge
