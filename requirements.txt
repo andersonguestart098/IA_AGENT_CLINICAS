@@ -1,23 +1,32 @@
+# Framework principal
 fastapi
 uvicorn
+
+# Tipagem e validação
 pydantic
-huggingface_hub
-transformers
-torch
-PyMuPDF
-langchain
-langchain-community
-langchain-huggingface
-pytesseract
-pillow
-pandas
+
+# Banco de dados
 prisma
+passlib
+
+# Manipulação de ambiente e arquivos
 python-dotenv
-pdfplumber
+python-multipart
+requests
+
+# OCR e arquivos
+pytesseract
 pdf2image
+pdfplumber
+Pillow
+
+# Machine Learning e IA
+transformers
+sentence-transformers
+torch
 faiss-cpu
 scikit-learn
-passlib
-requests
-python-multipart
-huggingface_hub[hf_xet]
+numpy
+
+# Suporte a CORS
+starlette

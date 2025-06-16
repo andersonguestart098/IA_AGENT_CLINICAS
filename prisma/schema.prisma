@@ -69,14 +69,16 @@ model Sessao {
 
 model FluxoConversa {
   id            Int      @id @default(autoincrement())
-  telefone      String   // ✅ novo campo para rastrear leads pelo número do WhatsApp
+  telefone      String
   sessionId     String
   userId        String
   etapaAtual    String
-  dadosParciais String   // <- Armazena JSON serializado
+  dadosParciais String   // histórico completo da conversa
+  pedido        String   @default("[]") // novo campo: lista JSON dos itens pedidos
   tipoFluxo     String
   status        String   @default("em_andamento")
   criadoEm      DateTime @default(now())
 }
+
 
 

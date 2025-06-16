@@ -32,6 +32,17 @@ from sentence_transformers import SentenceTransformer
 from collections import defaultdict
 import asyncio
 import time
+from faster_whisper import WhisperModel
+from tempfile import NamedTemporaryFile
+from fastapi.staticfiles import StaticFiles
+import secrets
+import socketio  # noqa: F401  # usado indiretamente pelo nome
+
+
+
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Carregar variáveis de ambiente
 load_dotenv()
@@ -70,6 +81,8 @@ WPP_RAW_TOKEN = os.getenv("WPP_TOKEN")
 
 NUMERO_GESTOR = os.getenv("WPP_GESTOR_VENDAS")
 
+app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+
 # Teste de saída
 print(f"🔑 CHAVE MISTRAL: {MISTRAL_API_KEY[:8]}...")  # só os primeiros dígitos
 if not MISTRAL_API_KEY:
@@ -91,6 +104,37 @@ locks_usuarios = defaultdict(asyncio.Lock)      # Lock por telefone (1 mensagem 
 
 # Modelo para embeddings
 embedding_model = None
+
+
+sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
+# Envolver o FastAPI com o Socket.IO
+socket_app = socketio.ASGIApp(sio, app)
+
+# Evento para nova conexão
+@sio.on("connect")
+async def connect(sid, environ):
+    print(f"🔌 Cliente conectado: {sid}")
+
+# Evento para desconexão
+@sio.on("disconnect")
+async def disconnect(sid):
+    print(f"❌ Cliente desconectado: {sid}")
+
+# Evento customizado para enviar pedido em tempo real
+@sio.on("atualizar_pedido")
+async def atualizar_pedido(sid, data):
+    session_id = data.get("sessionId")
+    novo_item = data.get("item")
+    if session_id and novo_item:
+        # atualizar banco
+        await adicionar_item_pedido(session_id, novo_item)
+        print(f"📦 Pedido atualizado: {novo_item} (sessão: {session_id})")
+
+        # emitir evento para todos os clientes conectados
+        await sio.emit("pedido_atualizado", {
+            "sessionId": session_id,
+            "item": novo_item
+        })
 
 def load_embedding_model():
     """Carrega o modelo de embeddings."""
@@ -128,77 +172,22 @@ def mensagem_inicial_simples(texto: str) -> bool:
     return texto in {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "tudo bem?", "e aí", "oie", "opa"}
 
 
-def precisa_atendimento_humano(mensagem, resultados_filtrados, intencao=None):
-    """
-    Determina se a consulta deve ser encaminhada para atendimento humano.
-    Versão corrigida para evitar encaminhamentos desnecessários.
-    
-    Args:
-        mensagem: Texto da pergunta do usuário
-        resultados_filtrados: Lista de tuplas (documento, score) encontrados
-        intencao: Classificação da intenção da pergunta (opcional)
-        
-    Returns:
-        Boolean indicando se precisa de atendimento humano
-    """
-    # Perguntas simples comuns que nunca devem ser encaminhadas
-    perguntas_simples = [
-        "horário", "horario", "atendimento", "funcionamento", 
-        "aberto", "fechado", "sábado", "sabado", "domingo", 
-        "endereço", "endereco", "localização", "localizacao",
-        "onde fica", "trabalha com", "produto", "piso", "vinílico", "vinilico",
-        "laminado", "vaga", "emprego", "currículo", "curriculo"
-    ]
-    
-    # Verificar se é uma pergunta simples
-    mensagem_lower = mensagem.lower()
-    for termo in perguntas_simples:
-        if termo in mensagem_lower:
-            # Se for pergunta simples e tiver qualquer documento, não encaminhar
-            if resultados_filtrados:
-                logger.info(f"✅ Pergunta simples sobre '{termo}' com documento encontrado, respondendo automaticamente")
-                return False
-    
-    # Palavras-chave que indicam necessidade de atendimento humano
-    palavras_chave = [
-        "reclamação", "problema", "insatisfeito", "erro", "defeito",
-        "garantia", "devolução", "reembolso", "desconto", "negociar",
-        "gerente", "supervisor", "atendente humano", "falar com pessoa"
-    ]
-    
-    # Verificar se a mensagem contém palavras-chave de reclamação
-    for palavra in palavras_chave:
-        if palavra in mensagem_lower:
-            logger.info(f"🔄 Encaminhando para humano: palavra-chave '{palavra}' detectada")
-            return True
-    
-    # Verificar se a intenção é reclamação
-    if intencao == "RECLAMACAO":
-        logger.info(f"🔄 Encaminhando para humano: intenção classificada como RECLAMACAO")
-        return True
-    
-    # Verificar se não há documentos relevantes
-    if not resultados_filtrados:
-        logger.info("🔄 Encaminhando para humano: nenhum documento relevante")
-        return True
-    
-    # Verificar se a similaridade é extremamente baixa (apenas para casos não cobertos acima)
-    # Threshold reduzido para evitar encaminhamentos desnecessários
-    if resultados_filtrados and resultados_filtrados[0][1] < 0.2:
-        logger.info(f"🔄 Encaminhando para humano: similaridade muito baixa ({resultados_filtrados[0][1]:.2f})")
-        return True
-    
+def precisa_atendimento_humano(*args, **kwargs) -> bool:
+    logger.info("🤖 Modo totem ativado - atendimento 100% automatizado.")
     return False
 
 
-def chamar_mistral_api(prompt: str, temperature: float = 0.3, max_tokens: int = 300, system_override: str = None) -> str:
+def chamar_mistral_api(prompt: str, temperature: float = 0.5, max_tokens: int = 300, system_override: str = None) -> str:
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
         "Content-Type": "application/json"
     }
 
     system_prompt = system_override or (
-        "Você é um atendente técnico da Cemear..."
+        "Você é um atendente animado e simpático de um restaurante fast-food em um totem de autoatendimento por voz.\n"
+        "Sua missão é atender o cliente com entusiasmo e cordialidade.\n"
+        "Use frases curtas, com energia positiva e educação, como se fosse um atendente experiente que ama o que faz.\n"
+        "Sempre confirme os pedidos, sugira bebidas ou sobremesas, e pergunte com empolgação se o cliente deseja mais alguma coisa."
     )
 
     messages = [
@@ -206,7 +195,6 @@ def chamar_mistral_api(prompt: str, temperature: float = 0.3, max_tokens: int = 
         {"role": "user", "content": prompt}
     ]
 
-    # Criação dinâmica do corpo da requisição
     body = {
         "model": MISTRAL_MODEL,
         "messages": messages,
@@ -214,7 +202,6 @@ def chamar_mistral_api(prompt: str, temperature: float = 0.3, max_tokens: int = 
         "max_tokens": max_tokens
     }
 
-    # ✅ Apenas quando está usando sampling (não é greedy)
     if temperature > 0.0:
         body["top_p"] = 0.95
 
@@ -255,7 +242,6 @@ def chamar_mistral_api(prompt: str, temperature: float = 0.3, max_tokens: int = 
     logger.error("❌ Falha após múltiplas tentativas com a Mistral API.")
     return "Estamos enfrentando instabilidade momentânea. Por favor, tente novamente em breve."
 
-
 def classificar_intencao_mistral(pergunta: str) -> str:
     if not pergunta or not pergunta.strip():
         logger.warning("⚠️ Pergunta vazia na classificação de intenção.")
@@ -264,12 +250,16 @@ def classificar_intencao_mistral(pergunta: str) -> str:
     pergunta = pergunta.strip()
 
     system_prompt = (
-        "Você é um classificador de intenção de mensagens no WhatsApp.\n"
-        "Responda sempre com apenas UMA das seguintes palavras, em letras MAIÚSCULAS e sem explicações:\n"
-        "SAUDACAO, INFORMACAO_TECNICA, ATENDIMENTO_REGIAO, ORCAMENTO, VAGAS, ELOGIO, RECLAMACAO, OUTRO"
+        "Você é um classificador de intenção para um sistema de pedidos de fast food por voz em um totem drive-thru.\n"
+        "Classifique a intenção da frase do cliente usando UMA das seguintes categorias, SEM explicações:\n\n"
+        "SAUDACAO - Ex: 'oi', 'boa tarde', 'alô'\n"
+        "FAZER_PEDIDO - Quando o cliente pede comida ou bebida\n"
+        "FINALIZAR_PEDIDO - Ex: 'só isso', 'pode fechar', 'quero pagar'\n"
+        "CANCELAR - Quando o cliente desiste do pedido\n"
+        "OUTRO - Qualquer outra coisa"
     )
 
-    user_prompt = f"Mensagem: {pergunta}\nQual a intenção principal?"
+    user_prompt = f"Frase do cliente: {pergunta}\nQual a intenção principal?"
 
     try:
         resposta = chamar_mistral_api(
@@ -280,34 +270,10 @@ def classificar_intencao_mistral(pergunta: str) -> str:
         )
 
         resposta = resposta.upper().strip()
-        logger.info(f"🧠 Mistral retornou intenção: '{resposta}'")
+        logger.info(f"🍔 Intenção classificada: '{resposta}'")
 
-        categorias_validas = {
-            "SAUDACAO", "INFORMACAO_TECNICA", "ATENDIMENTO_REGIAO",
-            "ORCAMENTO", "VAGAS", "ELOGIO", "RECLAMACAO", "OUTRO"
-        }
-
-        if resposta in categorias_validas:
-            return resposta
-
-        # Correção bruta se vier com erros pequenos
-        if "ORÇA" in resposta or "COTA" in resposta or "PREÇO" in resposta:
-            return "ORCAMENTO"
-        if "SAUDA" in resposta or "OLÁ" in resposta or "OI" in resposta:
-            return "SAUDACAO"
-        if "TÉCNIC" in resposta or "PRODUTO" in resposta or "INFO" in resposta:
-            return "INFORMACAO_TECNICA"
-        if "REGI" in resposta or "LOCAL" in resposta:
-            return "ATENDIMENTO_REGIAO"
-        if "VAGA" in resposta or "TRABALHO" in resposta:
-            return "VAGAS"
-        if "ELOGI" in resposta or "PARABÉNS" in resposta:
-            return "ELOGIO"
-        if "RECLAM" in resposta or "PROBLEMA" in resposta or "ERRO" in resposta:
-            return "RECLAMACAO"
-
-        logger.warning(f"⚠️ Resposta inesperada: {resposta}")
-        return "OUTRO"
+        categorias_validas = {"SAUDACAO", "FAZER_PEDIDO", "FINALIZAR_PEDIDO", "CANCELAR", "OUTRO"}
+        return resposta if resposta in categorias_validas else "OUTRO"
 
     except Exception as e:
         logger.error(f"❌ Erro na classificação de intenção: {e}")
@@ -663,6 +629,23 @@ def get_token_dinamico():
         logger.error(f"❌ Erro ao buscar token dinâmico: {e}")
         return None
 
+async def adicionar_item_pedido(session_id: str, novo_item: str):
+    fluxo = await prisma.fluxoconversa.find_first(where={"sessionId": session_id})
+    if not fluxo:
+        return
+
+    try:
+        pedido = json.loads(fluxo.pedido or "[]")
+    except:
+        pedido = []
+
+    pedido.append(novo_item)
+
+    await prisma.fluxoconversa.update(
+        where={"id": fluxo.id},
+        data={"pedido": json.dumps(pedido, ensure_ascii=False)}
+    )
+
 
 # FAISS com produto interno (ideal para vetores normalizados)
 faiss_index = faiss.IndexFlatIP(384)  # 384 = dimensão do embedding
@@ -724,6 +707,9 @@ async def shutdown():
 # Modelo para requisições de chat
 class PromptRequest(BaseModel):
     question: str
+    session_id: str
+    user_id: str
+
 
 @app.post("/chat-atendente")
 async def chat_atendente(data: PromptRequest):
@@ -813,6 +799,169 @@ PERGUNTA:
         logger.error("❌ Erro no /chat-atendente:\n%s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Erro interno ao processar atendimento.")
 
+@app.post("/chat-com-voz")
+async def chat_com_voz(data: PromptRequest):
+    try:
+        texto = data.question.strip()
+        session_id = data.session_id.strip()
+        user_id = data.user_id.strip()
+
+        if not texto or not session_id or not user_id:
+            raise HTTPException(status_code=400, detail="Campos obrigatórios ausentes.")
+
+        fluxo = await prisma.fluxoconversa.find_first(where={"sessionId": session_id})
+
+        if not fluxo:
+            fluxo = await prisma.fluxoconversa.create(
+                data={
+                    "telefone": user_id,
+                    "sessionId": session_id,
+                    "userId": user_id,
+                    "etapaAtual": "inicio",
+                    "dadosParciais": "{}",
+                    "tipoFluxo": "voz_drive_thru"
+                }
+            )
+
+        etapa = fluxo.etapaAtual
+        dados_parciais = json.loads(fluxo.dadosParciais)
+
+        if "pedido" not in dados_parciais:
+            dados_parciais["pedido"] = []
+
+        documentos = await prisma.knowledgebase.find_many()
+        doc = next((d for d in documentos if "drive" in d.origem.lower()), None)
+        contexto = doc.conteudo.strip() if doc else ""
+
+        if etapa == "inicio":
+            prompt = f"""
+Você é um atendente de drive-thru por voz do restaurante Suny Burger.
+
+Dê apenas uma saudação inicial amigável e clara, como:
+"Olá, meu nome é Anderson. Seja bem-vindo ao Suny Burger! O que você gostaria de pedir hoje?"
+
+Após a saudação, escute e registre com precisão o primeiro item que o cliente mencionar. Não se apresente novamente nas próximas interações.
+
+Base oficial de atendimento:
+{contexto}
+"""
+            proxima_etapa = "meio"
+
+        elif etapa == "meio":
+            prompt = f"""
+Você é um atendente de drive-thru por voz do restaurante Suny Burger. O cliente está montando seu pedido por etapas.
+
+Base oficial de atendimento:
+{contexto}
+
+Histórico do pedido até agora:
+{json.dumps(dados_parciais["pedido"], ensure_ascii=False)}
+
+Fala do cliente:
+{texto}
+
+Atualize o pedido com base na fala, acrescentando, corrigindo ou removendo itens se necessário.
+Se ainda não houver batata, bebida ou sobremesa, sugira gentilmente.
+Não se apresente novamente. Seja claro, simpático e direto.
+"""
+            proxima_etapa = "meio"
+            dados_parciais["pedido"].append(texto)
+
+        elif etapa == "fim":
+            prompt = f"""
+Você é um atendente do Suny Burger. O cliente está finalizando o pedido.
+
+Pedido registrado:
+{json.dumps(dados_parciais["pedido"], ensure_ascii=False)}
+
+Fala do cliente:
+{texto}
+
+Confirme item por item e pergunte se está tudo certo ou se deseja alterar algo.
+Finalize o atendimento com simpatia, sem se apresentar novamente.
+"""
+            proxima_etapa = "concluido"
+
+        else:
+            prompt = f"""
+Fala final do cliente:
+{texto}
+
+Finalize o atendimento confirmando o pedido e agradecendo pela preferência.
+Diga apenas: "Pedido finalizado. Obrigado e bom apetite!".
+"""
+            proxima_etapa = "concluido"
+
+        resposta = chamar_mistral_api(
+            prompt,
+            temperature=0.5,
+            max_tokens=300,
+            system_override=(
+                "Você é o atendente virtual por voz do Suny Burger. "
+                "Nunca se apresente novamente após a primeira fala. "
+                "Mantenha o pedido sempre atualizado com base nas falas do cliente. "
+                "Seja simpático, confirme os itens, sugira batata, bebida ou sobremesa se ainda não foram pedidos, "
+                "e nunca invente itens. Finalize o atendimento somente quando o cliente indicar."
+            )
+        )
+
+        if not resposta or not resposta.strip():
+            raise Exception("Resposta da IA está vazia.")
+
+        logger.info(f"🧠 Resposta da IA: {resposta}")
+
+        await prisma.fluxoconversa.update(
+            where={"id": fluxo.id},
+            data={
+                "etapaAtual": proxima_etapa,
+                "dadosParciais": json.dumps(dados_parciais, ensure_ascii=False),
+                "pedido": json.dumps(dados_parciais["pedido"], ensure_ascii=False)
+            }
+        )
+
+        api_key = os.getenv("ELEVEN_API_KEY")
+        voice_id = os.getenv("ELEVEN_VOICE_ID", "TxGEqnHWrfWFTf9aZ8sM")
+        audio_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+
+        headers = {
+            "xi-api-key": api_key,
+            "Content-Type": "application/json"
+        }
+        body = {
+            "text": resposta,
+            "voice_settings": {
+                "stability": 0.4,
+                "similarity_boost": 0.9
+            }
+        }
+
+        res = requests.post(audio_url, headers=headers, json=body)
+
+        if res.status_code != 200:
+            logger.error(f"❌ Erro ElevenLabs: {res.status_code} - {res.text}")
+            return {
+                "resposta_texto": resposta,
+                "resposta_audio": None
+            }
+
+        output_dir = Path("outputs")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"resposta_{int(time.time())}.mp3"
+
+        with open(output_path, "wb") as f:
+            f.write(res.content)
+
+        return {
+            "resposta_texto": resposta,
+            "resposta_audio": f"/outputs/{output_path.name}"
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Erro no /chat-com-voz: {e}")
+        raise HTTPException(status_code=500, detail="Erro no chat com voz.")
+
+
+
 
 @app.post("/upload")
 async def upload_conhecimento(file: UploadFile = File(...)):
@@ -866,8 +1015,142 @@ async def whatsapp_webhook(request: Request):
     except Exception as e:
         logger.error(f"❌ Erro no webhook WhatsApp:\n{traceback.format_exc()}")
         return {"status": "erro", "mensagem": str(e)}
+    
+@app.post("/escutar")
+async def escutar_audio(file: UploadFile = File(...)):
+    """Transcreve áudio enviado (voz → texto) usando faster-whisper."""
+    try:
+        # Salvar áudio temporariamente
+        with NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
+            temp_audio.write(await file.read())
+            caminho = temp_audio.name
 
-# Executar a aplicação
+        model = WhisperModel("small", device="cuda" if torch.cuda.is_available() else "cpu")
+        segments, _ = model.transcribe(caminho)
+
+        transcricao = " ".join(segment.text for segment in segments)
+        return {"transcricao": transcricao.strip()}
+
+    except Exception as e:
+        logger.error(f"❌ Erro ao transcrever áudio: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao transcrever áudio.")
+
+
+@app.post("/falar")
+async def falar_com_ia(prompt: PromptRequest):
+    """Converte texto em voz realista (texto → fala) com ElevenLabs."""
+    try:
+        texto = prompt.question.strip()
+        if not texto:
+            raise HTTPException(status_code=400, detail="Texto vazio.")
+
+        api_key = os.getenv("ELEVEN_API_KEY")
+        voice_id = os.getenv("ELEVEN_VOICE_ID", "TxGEqnHWrfWFTf9aZ8sM")  # padrão
+
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {
+            "xi-api-key": api_key,
+            "Content-Type": "application/json"
+        }
+        body = {
+            "text": texto,
+            "voice_settings": {
+                "stability": 0.4,
+                "similarity_boost": 0.9
+            }
+        }
+
+        resposta = requests.post(url, headers=headers, json=body)
+        if resposta.status_code != 200:
+            raise Exception(f"Erro ElevenLabs: {resposta.status_code} - {resposta.text}")
+
+        output_path = f"outputs/resposta_{int(time.time())}.mp3"
+        Path("outputs").mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(resposta.content)
+
+        return {
+            "audio_path": output_path,
+            "mensagem_original": texto
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Erro no TTS: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao gerar áudio.")
+    
+
+@app.post("/registro")
+async def registrar_usuario(nome: str = Form(...), email: str = Form(...), senha: str = Form(...)):
+    try:
+        usuario_existente = await prisma.usuario.find_unique(where={"email": email})
+        if usuario_existente:
+            raise HTTPException(status_code=400, detail="E-mail já cadastrado.")
+
+        senha_hash = pwd_context.hash(senha)
+
+        novo_usuario = await prisma.usuario.create(data={
+            "nome": nome,
+            "email": email,
+            "senhaHash": senha_hash
+        })
+
+        return {
+            "message": "✅ Registro realizado com sucesso.",
+            "userId": novo_usuario.id
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Erro no registro: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao registrar.")
+
+@app.post("/login")
+async def login_usuario(email: str = Form(...), senha: str = Form(...)):
+    try:
+        usuario = await prisma.usuario.find_unique(where={"email": email})
+        if not usuario or not pwd_context.verify(senha, usuario.senhaHash):
+            raise HTTPException(status_code=401, detail="Credenciais inválidas.")
+
+        token = secrets.token_hex(16)
+
+        nova_sessao = await prisma.sessao.create(data={
+            "token": token,
+            "usuarioId": usuario.id
+        })
+
+        # Iniciar novo fluxo de conversa
+        await prisma.fluxoconversa.create(data={
+            "telefone": usuario.email,
+            "sessionId": token,
+            "userId": usuario.id,
+            "etapaAtual": "inicio",
+            "dadosParciais": "{}",
+            "tipoFluxo": "voz_drive_thru"
+        })
+
+        return {
+            "message": "✅ Login realizado com sucesso.",
+            "userId": usuario.id,
+            "sessionId": token
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Erro no login: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao realizar login.")
+    
+@app.get("/pedido")
+async def obter_pedido(session_id: str):
+    fluxo = await prisma.fluxoconversa.find_first(where={"sessionId": session_id})
+    if not fluxo:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada.")
+    
+    try:
+        pedido = json.loads(fluxo.pedido or "[]")
+    except:
+        pedido = []
+
+    return {"pedido": pedido}
+
+    
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(socket_app, host="0.0.0.0", port=8000)
