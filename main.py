@@ -36,8 +36,12 @@ from faster_whisper import WhisperModel
 from tempfile import NamedTemporaryFile
 from fastapi.staticfiles import StaticFiles
 import secrets
-import socketio  # noqa: F401  # usado indiretamente pelo nome
-
+import socketio  # F401  # usado indiretamente pelo nome
+from bark import generate_audio, preload_models
+import scipy.io.wavfile
+import numpy as np
+import time
+from pathlib import Path
 
 
 from passlib.context import CryptContext
@@ -184,10 +188,14 @@ def chamar_mistral_api(prompt: str, temperature: float = 0.5, max_tokens: int = 
     }
 
     system_prompt = system_override or (
-        "Você é um atendente animado e simpático de um restaurante fast-food em um totem de autoatendimento por voz.\n"
-        "Sua missão é atender o cliente com entusiasmo e cordialidade.\n"
-        "Use frases curtas, com energia positiva e educação, como se fosse um atendente experiente que ama o que faz.\n"
-        "Sempre confirme os pedidos, sugira bebidas ou sobremesas, e pergunte com empolgação se o cliente deseja mais alguma coisa."
+        "Você é um atendente virtual simpático da Unimed, com voz jovem e empática.\n"
+        "Sua missão é ajudar o paciente de forma clara, respeitosa e acolhedora.\n"
+        "Você pode:\n"
+        "- Agendar consultas ou exames\n"
+        "- Verificar se há agendamentos existentes\n"
+        - "Fornecer informações pós-consulta como orientações e agradecimentos\n"
+        "- Encaminhar para atendimento humano, se necessário\n\n"
+        "Sempre use frases curtas, claras e educadas. Pergunte o nome completo e CPF/CNS do paciente quando necessário."
     )
 
     messages = [
@@ -244,22 +252,23 @@ def chamar_mistral_api(prompt: str, temperature: float = 0.5, max_tokens: int = 
 
 def classificar_intencao_mistral(pergunta: str) -> str:
     if not pergunta or not pergunta.strip():
-        logger.warning("⚠️ Pergunta vazia na classificação de intenção.")
+        logger.warning("⚠️ Pergunta vazia na classificação de intenção.")
         return "OUTRO"
 
     pergunta = pergunta.strip()
 
     system_prompt = (
-        "Você é um classificador de intenção para um sistema de pedidos de fast food por voz em um totem drive-thru.\n"
-        "Classifique a intenção da frase do cliente usando UMA das seguintes categorias, SEM explicações:\n\n"
-        "SAUDACAO - Ex: 'oi', 'boa tarde', 'alô'\n"
-        "FAZER_PEDIDO - Quando o cliente pede comida ou bebida\n"
-        "FINALIZAR_PEDIDO - Ex: 'só isso', 'pode fechar', 'quero pagar'\n"
-        "CANCELAR - Quando o cliente desiste do pedido\n"
-        "OUTRO - Qualquer outra coisa"
+        "Você é um classificador de intenção para uma assistente virtual da Unimed.\n"
+        "Classifique a intenção da frase do paciente usando apenas UMA das seguintes categorias (sem explicações):\n\n"
+        "SAUDACAO - Ex: 'oi', 'bom dia', 'olá'\n"
+        "AGENDAR_CONSULTA - Quando o paciente deseja marcar consulta, exame ou atendimento\n"
+        "CONSULTAR_AGENDAMENTO - Quando o paciente pergunta se já tem consulta marcada ou quer verificar agendamentos\n"
+        "POS_CONSULTA - Quando o paciente comenta que já foi atendido e deseja orientações, agradece ou relata como foi\n"
+        "CANCELAR - Quando o paciente quer desmarcar ou cancelar uma consulta ou exame\n"
+        "OUTRO - Qualquer outro assunto"
     )
 
-    user_prompt = f"Frase do cliente: {pergunta}\nQual a intenção principal?"
+    user_prompt = f"Frase do paciente: {pergunta}\nQual a intenção principal?"
 
     try:
         resposta = chamar_mistral_api(
@@ -270,15 +279,22 @@ def classificar_intencao_mistral(pergunta: str) -> str:
         )
 
         resposta = resposta.upper().strip()
-        logger.info(f"🍔 Intenção classificada: '{resposta}'")
+        logger.info(f"🩺 Intenção classificada: '{resposta}'")
 
-        categorias_validas = {"SAUDACAO", "FAZER_PEDIDO", "FINALIZAR_PEDIDO", "CANCELAR", "OUTRO"}
+        categorias_validas = {
+            "SAUDACAO",
+            "AGENDAR_CONSULTA",
+            "CONSULTAR_AGENDAMENTO",
+            "CANCELAR",
+            "POS_CONSULTA",
+            "OUTRO"
+        }
+
         return resposta if resposta in categorias_validas else "OUTRO"
 
     except Exception as e:
         logger.error(f"❌ Erro na classificação de intenção: {e}")
         return "OUTRO"
-
 
 async def processar_mensagem_whatsapp(dados: dict):
     try:
@@ -529,7 +545,6 @@ async def processar_fila_usuario(telefone):
                 await processar_mensagem_whatsapp(dados)
             except Exception as e:
                 logger.error(f"❌ Erro ao processar fila de {telefone}: {e}")
-
 
 def notificar_gestor_contato(telefone_cliente: str, mensagem_cliente: str, nome_cliente: str = "") -> bool:
     """
@@ -819,90 +834,105 @@ async def chat_com_voz(data: PromptRequest):
                     "userId": user_id,
                     "etapaAtual": "inicio",
                     "dadosParciais": "{}",
-                    "tipoFluxo": "voz_drive_thru"
+                    "tipoFluxo": "voz_unimed"
                 }
             )
 
         etapa = fluxo.etapaAtual
-        dados_parciais = json.loads(fluxo.dadosParciais)
+        dados_parciais = json.loads(fluxo.dadosParciais or "{}")
+        if "dados" not in dados_parciais:
+            dados_parciais["dados"] = []
 
-        if "pedido" not in dados_parciais:
-            dados_parciais["pedido"] = []
+        intencao = classificar_intencao_mistral(texto)
+        logger.info(f"🎯 Intencao classificada: {intencao}")
 
-        documentos = await prisma.knowledgebase.find_many()
-        doc = next((d for d in documentos if "drive" in d.origem.lower()), None)
-        contexto = doc.conteudo.strip() if doc else ""
+        pedido_atual = json.loads(fluxo.pedido or "[]")
+        if intencao != "OUTRO" and intencao not in pedido_atual:
+            pedido_atual.append(intencao)
 
-        if etapa == "inicio":
-            prompt = f"""
-Você é um atendente de drive-thru por voz do restaurante Suny Burger.
+        # Busca contexto via FAISS
+        emb = np.array(json.loads(gerar_embedding(texto)), dtype=np.float32).reshape(1, -1)
+        emb = normalize(emb, axis=1)
+        D, I = faiss_index.search(emb, 1)
 
-Dê apenas uma saudação inicial amigável e clara, como:
-"Olá, meu nome é Anderson. Seja bem-vindo ao Suny Burger! O que você gostaria de pedir hoje?"
+        if I[0][0] != -1:
+            doc_id = id_map[I[0][0]]
+            doc = await prisma.knowledgebase.find_unique(where={"id": doc_id})
+            contexto = doc.conteudo.strip() if doc else ""
+        else:
+            contexto = ""
 
-Após a saudação, escute e registre com precisão o primeiro item que o cliente mencionar. Não se apresente novamente nas próximas interações.
-
-Base oficial de atendimento:
-{contexto}
+        # Instrução para NÃO cumprimentar fora do início
+        INSTRUCOES_PADRAO = """
+Você é a atendente virtual por voz da Clínica Unimed.
+Seu papel é acolher, orientar e organizar o agendamento de consultas e exames de forma clara, cordial e eficiente.
+Siga este fluxo:
+- Só cumprimente no INÍCIO do atendimento. NÃO repita cumprimentos em etapas posteriores.
+- Evite repetições excessivas de boas-vindas.
+- Siga as instruções técnicas abaixo para cada necessidade.
 """
+        # Prompt e instrução para cada etapa
+        if etapa == "inicio" and intencao == "SAUDACAO":
+            prompt = f"Paciente disse: {texto}\nSaúde-o cordialmente e pergunte em que posso ajudar."
+            system_override = INSTRUCOES_PADRAO + "\n(Etapa: início. Permita saudação inicial.)\n" + contexto
+            proxima_etapa = "meio"
+
+        elif etapa == "inicio":
+            prompt = f"""
+{contexto}
+
+Fala do paciente:
+{texto}
+"""
+            system_override = INSTRUCOES_PADRAO + "\n(Não precisa de saudação.)\n" + contexto
             proxima_etapa = "meio"
 
         elif etapa == "meio":
-            prompt = f"""
-Você é um atendente de drive-thru por voz do restaurante Suny Burger. O cliente está montando seu pedido por etapas.
-
-Base oficial de atendimento:
+            if intencao == "SAUDACAO":
+                # Evita saudação repetida
+                prompt = "O paciente cumprimentou novamente. NÃO cumprimente de novo. Apenas pergunte de forma objetiva como pode ajudar."
+                system_override = INSTRUCOES_PADRAO + "\n(NÃO cumprimente novamente, apenas continue o atendimento normalmente.)\n" + contexto
+            else:
+                prompt = f"""
 {contexto}
 
-Histórico do pedido até agora:
-{json.dumps(dados_parciais["pedido"], ensure_ascii=False)}
+Informações acumuladas:
+{json.dumps(dados_parciais["dados"], ensure_ascii=False)}
 
-Fala do cliente:
+Fala do paciente:
 {texto}
-
-Atualize o pedido com base na fala, acrescentando, corrigindo ou removendo itens se necessário.
-Se ainda não houver batata, bebida ou sobremesa, sugira gentilmente.
-Não se apresente novamente. Seja claro, simpático e direto.
 """
+                system_override = INSTRUCOES_PADRAO + "\n(Não precisa repetir saudação.)\n" + contexto
+                dados_parciais["dados"].append(texto)
             proxima_etapa = "meio"
-            dados_parciais["pedido"].append(texto)
 
         elif etapa == "fim":
-            prompt = f"""
-Você é um atendente do Suny Burger. O cliente está finalizando o pedido.
+            if intencao == "SAUDACAO":
+                prompt = "O paciente enviou um cumprimento ao final do atendimento. Finalize de forma cordial, sem dar boas-vindas novamente."
+                system_override = INSTRUCOES_PADRAO + "\n(NÃO cumprimente novamente, apenas finalize cordialmente.)\n" + contexto
+            else:
+                prompt = f"""
+{contexto}
 
-Pedido registrado:
-{json.dumps(dados_parciais["pedido"], ensure_ascii=False)}
+Resumo das informações:
+{json.dumps(dados_parciais["dados"], ensure_ascii=False)}
 
-Fala do cliente:
+Fala do paciente:
 {texto}
-
-Confirme item por item e pergunte se está tudo certo ou se deseja alterar algo.
-Finalize o atendimento com simpatia, sem se apresentar novamente.
 """
+                system_override = INSTRUCOES_PADRAO + "\n(Não precisa repetir saudação.)\n" + contexto
             proxima_etapa = "concluido"
 
         else:
-            prompt = f"""
-Fala final do cliente:
-{texto}
-
-Finalize o atendimento confirmando o pedido e agradecendo pela preferência.
-Diga apenas: "Pedido finalizado. Obrigado e bom apetite!".
-"""
+            prompt = f"Paciente disse: {texto}\nAgradeça pela preferência e encerre de forma cordial."
+            system_override = INSTRUCOES_PADRAO + "\n(Apenas agradeça, sem cumprimentar.)\n" + contexto
             proxima_etapa = "concluido"
 
         resposta = chamar_mistral_api(
             prompt,
-            temperature=0.5,
+            temperature=0.4,
             max_tokens=300,
-            system_override=(
-                "Você é o atendente virtual por voz do Suny Burger. "
-                "Nunca se apresente novamente após a primeira fala. "
-                "Mantenha o pedido sempre atualizado com base nas falas do cliente. "
-                "Seja simpático, confirme os itens, sugira batata, bebida ou sobremesa se ainda não foram pedidos, "
-                "e nunca invente itens. Finalize o atendimento somente quando o cliente indicar."
-            )
+            system_override=system_override
         )
 
         if not resposta or not resposta.strip():
@@ -915,10 +945,11 @@ Diga apenas: "Pedido finalizado. Obrigado e bom apetite!".
             data={
                 "etapaAtual": proxima_etapa,
                 "dadosParciais": json.dumps(dados_parciais, ensure_ascii=False),
-                "pedido": json.dumps(dados_parciais["pedido"], ensure_ascii=False)
+                "pedido": json.dumps(pedido_atual, ensure_ascii=False)
             }
         )
 
+        # Geração de áudio (ElevenLabs)
         api_key = os.getenv("ELEVEN_API_KEY")
         voice_id = os.getenv("ELEVEN_VOICE_ID", "TxGEqnHWrfWFTf9aZ8sM")
         audio_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
@@ -959,7 +990,6 @@ Diga apenas: "Pedido finalizado. Obrigado e bom apetite!".
     except Exception as e:
         logger.error(f"❌ Erro no /chat-com-voz: {e}")
         raise HTTPException(status_code=500, detail="Erro no chat com voz.")
-
 
 
 
@@ -1035,47 +1065,33 @@ async def escutar_audio(file: UploadFile = File(...)):
         logger.error(f"❌ Erro ao transcrever áudio: {e}")
         raise HTTPException(status_code=500, detail="Erro ao transcrever áudio.")
 
+preload_models()
 
 @app.post("/falar")
 async def falar_com_ia(prompt: PromptRequest):
-    """Converte texto em voz realista (texto → fala) com ElevenLabs."""
+    """Converte texto em fala com voz em português usando Bark (open-source)."""
     try:
         texto = prompt.question.strip()
         if not texto:
             raise HTTPException(status_code=400, detail="Texto vazio.")
 
-        api_key = os.getenv("ELEVEN_API_KEY")
-        voice_id = os.getenv("ELEVEN_VOICE_ID", "TxGEqnHWrfWFTf9aZ8sM")  # padrão
+        # Gera áudio em português (voz padrão do modelo Bark para "pt")
+        audio_array = generate_audio(texto, history_prompt="pt")
 
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-        headers = {
-            "xi-api-key": api_key,
-            "Content-Type": "application/json"
-        }
-        body = {
-            "text": texto,
-            "voice_settings": {
-                "stability": 0.4,
-                "similarity_boost": 0.9
-            }
-        }
+        output_dir = Path("outputs")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"resposta_{int(time.time())}.wav"
 
-        resposta = requests.post(url, headers=headers, json=body)
-        if resposta.status_code != 200:
-            raise Exception(f"Erro ElevenLabs: {resposta.status_code} - {resposta.text}")
-
-        output_path = f"outputs/resposta_{int(time.time())}.mp3"
-        Path("outputs").mkdir(parents=True, exist_ok=True)
-        with open(output_path, "wb") as f:
-            f.write(resposta.content)
+        # Salva o áudio como .wav
+        scipy.io.wavfile.write(output_path, rate=24_000, data=audio_array)
 
         return {
-            "audio_path": output_path,
+            "audio_path": f"/outputs/{output_path.name}",
             "mensagem_original": texto
         }
 
     except Exception as e:
-        logger.error(f"❌ Erro no TTS: {e}")
+        logger.error(f"❌ Erro ao gerar áudio com Bark: {e}")
         raise HTTPException(status_code=500, detail="Erro ao gerar áudio.")
     
 
